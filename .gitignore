@@ -1,0 +1,33 @@
+# Local Python and editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.vscode/
+.env
+.env.*
+!.env.example
+
+# Dataset images, annotations, generated versions, and labeler session state
+/datasets/
+/labeler_recent.yaml
+
+# Model downloads, checkpoints, training output, and recordings
+/models/
+/weights/
+/runs/
+/recordings/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+*.npz
+
+# Temporary files
+*.tmp
+*.log
