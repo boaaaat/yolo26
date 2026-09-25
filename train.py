@@ -7,12 +7,12 @@ from dataset_project import recent_dataset
 from ultralytics import YOLO
 
 
-# Set DATASET_PATH to a directory or data.yaml to override the latest generated version.
-DATASET_PATH = None
+# Train on generated v1. Set to None to use the latest generated version instead.
+DATASET_PATH = Path(__file__).resolve().parent / "datasets" / "versions" / "v1"
 MODEL = "yolo26m.pt"  # Pretrained medium model used for a new run.
 EPOCHS = 250  # Total for "new"; additional epochs for "continue".
 IMAGE_SIZE = 1024
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 DEVICE = 0  # First NVIDIA GPU; use "cpu" to train without CUDA.
 WORKERS = 4
 RUNS_DIR = Path(__file__).resolve().parent / "runs"

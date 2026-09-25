@@ -523,7 +523,7 @@ class DatasetGeneratorDialog(QDialog):
         self.setMinimumWidth(520)
 
         layout = QVBoxLayout(self)
-        intro = QLabel("Build a new dataset version from reviewed images. Source images stay in place.")
+        intro = QLabel("Build a new dataset version from labeled/images and labeled/labels. Source images stay in place.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -537,10 +537,6 @@ class DatasetGeneratorDialog(QDialog):
             classes.addWidget(checkbox)
         classes.addStretch()
         layout.addLayout(classes)
-
-        self.include_existing = QCheckBox("Include existing train / valid / test images")
-        self.include_existing.setChecked(True)
-        layout.addWidget(self.include_existing)
 
         form = QFormLayout()
         self.train_percent = QSpinBox()
@@ -625,7 +621,6 @@ class DatasetGeneratorDialog(QDialog):
         included = set(settings.get("included_class_ids", range(len(self.class_checks))))
         for index, checkbox in enumerate(self.class_checks):
             checkbox.setChecked(index in included)
-        self.include_existing.setChecked(bool(settings.get("include_existing", True)))
         self.train_percent.setValue(int(settings.get("train_percent", 80)))
         self.valid_percent.setValue(int(settings.get("valid_percent", 15)))
         self.augment_copies.setValue(int(settings.get("augment_copies", 1)))
@@ -653,7 +648,6 @@ class DatasetGeneratorDialog(QDialog):
             return
         config = GenerateConfig(
             included_class_ids=included,
-            include_existing=self.include_existing.isChecked(),
             train_percent=self.train_percent.value(),
             valid_percent=self.valid_percent.value(),
             augment_copies=self.augment_copies.value(),
@@ -825,7 +819,7 @@ class LabelerWindow(QMainWindow):
         self.folder_label.setWordWrap(True)
         left_layout.addWidget(self.folder_label)
         left_layout.addWidget(self._button("Open dataset…", self.open_dataset))
-        left_layout.addWidget(self._button("Open folder…", self.open_folder))
+        left_layout.addWidget(self._button("Open unlabeled", self.open_unlabeled))
         left_layout.addWidget(self._button("Open labeled", self.open_labeled))
         left_layout.addWidget(self._button("Generate dataset…", self.open_generator))
         self.queue_count = QLabel()
@@ -947,24 +941,24 @@ class LabelerWindow(QMainWindow):
             return preferred
         return sidecar
 
-    def open_folder(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Open image folder", str(self.source_dir.parent))
-        if not selected:
-            return
-        self.switch_folder(Path(selected))
+    def open_unlabeled(self) -> None:
+        self.switch_folder(self.dataset_dir / "unlabeled", dataset_root=self.dataset_dir)
 
     def open_dataset(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Open dataset", str(self.dataset_dir.parent))
+        selected = QFileDialog.getExistingDirectory(self, "Open dataset root", str(self.dataset_dir.parent))
         if selected:
-            self.switch_folder(Path(selected), restore_state=True, dataset_root=Path(selected))
+            folder = Path(selected).expanduser().resolve()
+            dataset_root = find_dataset_root(folder, self.dataset_dir)
+            self.switch_folder(dataset_root / "unlabeled", dataset_root=dataset_root)
 
     def open_labeled(self) -> None:
-        self.switch_folder(self.dataset_dir / "labeled")
+        dataset_root = find_dataset_root(self.dataset_dir, self.dataset_dir)
+        self.switch_folder(dataset_root / "labeled", dataset_root=dataset_root)
 
     def switch_folder(self, folder: Path, *, restore_state: bool = False,
                       dataset_root: Path | None = None) -> None:
         folder = folder.expanduser().resolve()
-        dataset_root = dataset_root.expanduser().resolve() if dataset_root else find_dataset_root(folder, self.dataset_dir)
+        dataset_root = find_dataset_root(dataset_root, self.dataset_dir) if dataset_root else find_dataset_root(folder, self.dataset_dir)
         if not self.suggest_button.isEnabled():
             QMessageBox.information(self, "Suggestion in progress", "Wait for the current suggestion to finish.")
             return

@@ -20,7 +20,6 @@ SPLITS = ("train", "valid", "test")
 @dataclass(frozen=True)
 class GenerateConfig:
     included_class_ids: tuple[int, ...]
-    include_existing: bool = True
     train_percent: int = 80
     valid_percent: int = 15
     augment_copies: int = 1
@@ -55,17 +54,16 @@ def _read_boxes(path: Path, class_count: int) -> list[tuple[int, float, float, f
     return boxes
 
 
-def _sources(dataset_dir: Path, include_existing: bool):
-    for source_name in (("labeled",) + SPLITS if include_existing else ("labeled",)):
-        image_dir = dataset_dir / source_name / "images"
-        label_dir = dataset_dir / source_name / "labels"
-        if not image_dir.is_dir():
-            continue
-        for image_path in sorted(image_dir.iterdir()):
-            if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES:
-                label_path = label_dir / f"{image_path.stem}.txt"
-                if label_path.is_file():
-                    yield source_name, image_path, label_path
+def _sources(dataset_dir: Path):
+    image_dir = dataset_dir / "labeled" / "images"
+    label_dir = dataset_dir / "labeled" / "labels"
+    if not image_dir.is_dir():
+        return
+    for image_path in sorted(image_dir.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in IMAGE_SUFFIXES:
+            label_path = label_dir / f"{image_path.stem}.txt"
+            if label_path.is_file():
+                yield "labeled", image_path, label_path
 
 
 def _image_hash(path: Path) -> str:
@@ -175,7 +173,7 @@ def generate_dataset(
     excluded_only = 0
     duplicates = 0
     scanned = 0
-    for source_name, image_path, label_path in _sources(dataset_dir, config.include_existing):
+    for source_name, image_path, label_path in _sources(dataset_dir):
         scanned += 1
         if progress and scanned % 50 == 0:
             progress(f"Reading source images and labels: {scanned} scanned...")

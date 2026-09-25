@@ -12,6 +12,18 @@ import yaml
 DEFAULT_COLORS = ("#ff6b6b", "#ffc857", "#56d6a5", "#71b7ff", "#c995ff")
 COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{6}\Z")
 RECENT_DATASET_FILE = Path(__file__).resolve().parent / "labeler_recent.yaml"
+DATASET_CHILD_FOLDERS = {"labeled", "unlabeled", "train", "valid", "val", "test"}
+
+
+def _parent_dataset_root(folder: Path) -> Path | None:
+    """Recognize an image/label split even if it has stray project metadata."""
+    parent_root = None
+    for candidate in (folder, *folder.parents):
+        if candidate.name.lower() in DATASET_CHILD_FOLDERS and (
+            (candidate.parent / "labeler.yaml").is_file() or (candidate.parent / "data.yaml").is_file()
+        ):
+            parent_root = candidate.parent
+    return parent_root
 
 
 def _atomic_write(path: Path, content: str | bytes) -> None:
@@ -141,6 +153,7 @@ class DatasetProject:
 
 def load_project(root: Path) -> DatasetProject:
     root = root.expanduser().resolve()
+    root = _parent_dataset_root(root) or root
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "labeler.yaml"
     if state_path.is_file():
@@ -173,6 +186,11 @@ def load_project(root: Path) -> DatasetProject:
 
 def find_dataset_root(folder: Path, current_root: Path) -> Path:
     folder = folder.expanduser().resolve()
+    parent_root = _parent_dataset_root(folder)
+    if parent_root is not None:
+        return parent_root
+    current_root = (_parent_dataset_root(current_root.expanduser().resolve())
+                    or current_root.expanduser().resolve())
     for candidate in (folder, *folder.parents):
         if (candidate / "labeler.yaml").is_file() or (candidate / "data.yaml").is_file():
             return candidate
@@ -187,7 +205,8 @@ def recent_dataset(default_root: Path) -> Path:
             data = yaml.safe_load(RECENT_DATASET_FILE.read_text(encoding="utf-8"))
             saved = data.get("last_dataset") if isinstance(data, dict) else None
             if isinstance(saved, str) and Path(saved).is_dir():
-                return Path(saved).expanduser().resolve()
+                saved_root = Path(saved).expanduser().resolve()
+                return _parent_dataset_root(saved_root) or saved_root
         except (OSError, yaml.YAMLError):
             pass
     return default_root.expanduser().resolve()
