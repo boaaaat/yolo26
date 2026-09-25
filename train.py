@@ -7,8 +7,9 @@ from dataset_project import recent_dataset
 from ultralytics import YOLO
 
 
-# Train on generated v1. Set to None to use the latest generated version instead.
-DATASET_PATH = Path(__file__).resolve().parent / "datasets" / "versions" / "v1"
+# Use the latest generated version in the most recently opened dataset.
+# Set a specific version path here to train that version instead.
+DATASET_PATH = None
 MODEL = "yolo26m.pt"  # Pretrained medium model used for a new run.
 EPOCHS = 250  # Total for "new"; additional epochs for "continue".
 IMAGE_SIZE = 1024

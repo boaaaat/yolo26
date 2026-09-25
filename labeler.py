@@ -1,15 +1,17 @@
 """Desktop box-labeling app for the local YOLO26 detection dataset."""
 
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from dataset_generator import GenerateConfig, generate_dataset
+from dataset_generator import GenerateConfig, generate_dataset, get_split_percentages
 from dataset_project import (
     DEFAULT_COLORS, DatasetProject, find_dataset_root, load_project,
     recent_dataset, remember_dataset,
 )
+from review_metadata import load_review_metadata, metadata_path, save_review_metadata
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -73,6 +75,7 @@ class Box:
     x2: float
     y2: float
     suggested: bool = False
+    confidence: float | None = None
 
     def rect(self) -> QRectF:
         return QRectF(self.x1, self.y1, self.x2 - self.x1, self.y2 - self.y1)
@@ -204,8 +207,10 @@ class LabelCanvas(QGraphicsView):
                 pen.setStyle(Qt.PenStyle.DashLine)
             rectangle = self.scene().addRect(box.rect(), pen, QBrush(QColor(color.red(), color.green(), color.blue(), 28)))
             self.annotation_items.append(rectangle)
+            suggestion_text = (f" · {box.confidence:.0%} suggestion" if box.confidence is not None
+                               else " · suggestion") if box.suggested else ""
             text = self.scene().addSimpleText(
-                self.class_names[box.class_id] + (" · suggestion" if box.suggested else ""),
+                self.class_names[box.class_id] + suggestion_text,
                 QFont("Segoe UI", 9, QFont.Weight.DemiBold),
             )
             text.setBrush(QBrush(color))
@@ -543,14 +548,14 @@ class DatasetGeneratorDialog(QDialog):
         self.train_percent.setRange(1, 98)
         self.train_percent.setValue(80)
         self.train_percent.setSuffix("%")
-        form.addRow("Training split", self.train_percent)
+        form.addRow("Target training split", self.train_percent)
         self.valid_percent = QSpinBox()
         self.valid_percent.setRange(1, 98)
         self.valid_percent.setValue(15)
         self.valid_percent.setSuffix("%")
-        form.addRow("Validation split", self.valid_percent)
+        form.addRow("Target validation split", self.valid_percent)
         self.test_percent = QLabel()
-        form.addRow("Test split", self.test_percent)
+        form.addRow("Target test split", self.test_percent)
         self.train_percent.valueChanged.connect(self._update_test_percent)
         self.valid_percent.valueChanged.connect(self._update_test_percent)
         self._update_test_percent()
@@ -613,6 +618,13 @@ class DatasetGeneratorDialog(QDialog):
         actions.addWidget(self.generate_button)
         layout.addLayout(actions)
         self._restore_settings()
+        fixed_split = get_split_percentages(self.dataset_dir)
+        if fixed_split is not None:
+            self.train_percent.setValue(fixed_split[0])
+            self.valid_percent.setValue(fixed_split[1])
+            self.train_percent.setEnabled(False)
+            self.valid_percent.setEnabled(False)
+            hint.setText(hint.text() + " Validation and test assignments are fixed across versions.")
 
     def _restore_settings(self) -> None:
         settings = self.project.generator_settings
@@ -686,6 +698,10 @@ class DatasetGeneratorDialog(QDialog):
         self.progress_label.setText(
             f"Created {path}\n{counts['train']} train, {counts['valid']} validation, "
             f"{counts['test']} test originals; {metadata['augmented_train_images']} augmented training images."
+            + (f" {metadata['split_conflicts_skipped']} images skipped to keep splits separate."
+               if metadata.get("split_conflicts_skipped") else "")
+            + (" Split assignments were saved in this version, but could not be copied to the dataset root."
+               if metadata.get("split_manifest_warning") else "")
         )
 
     def on_generation_failed(self, message: str) -> None:
@@ -719,6 +735,7 @@ class LabelerWindow(QMainWindow):
         self.source_dir, self.labels_dir = folder_layout(restored_folder)
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.current_path: Path | None = None
+        self.review_data: dict | None = None
         self.saved_signature: tuple = ()
         self.undo_history: list[list[Box]] = []
         self.redo_history: list[list[Box]] = []
@@ -849,6 +866,9 @@ class LabelerWindow(QMainWindow):
         self.image_title = QLabel("No images in unlabeled")
         self.image_title.setObjectName("heading")
         center_layout.addWidget(self.image_title)
+        self.review_info = QLabel()
+        self.review_info.setObjectName("muted")
+        center_layout.addWidget(self.review_info)
         self.canvas = LabelCanvas(self.class_names, self.class_colors)
         self.canvas.changed.connect(self.record_change)
         self.canvas.selection_changed.connect(self.on_canvas_selection)
@@ -1003,6 +1023,8 @@ class LabelerWindow(QMainWindow):
         self.source_dir = image_dir
         self.labels_dir = label_dir
         self.current_path = None
+        self.review_data = None
+        self.review_info.clear()
         self.canvas.clear_image()
         self.refresh_box_list()
         self.search.clear()
@@ -1102,11 +1124,15 @@ class LabelerWindow(QMainWindow):
                 )
             else:
                 self.current_path = None
+                self.review_data = None
+                self.review_info.clear()
                 self.image_title.setText("No images match this filter")
                 self.canvas.clear_image()
                 self.refresh_box_list()
         elif not images:
             self.current_path = None
+            self.review_data = None
+            self.review_info.clear()
             self.image_title.setText(f"No images in {self.source_dir.name}")
             self.canvas.clear_image()
             self.refresh_box_list()
@@ -1163,6 +1189,37 @@ class LabelerWindow(QMainWindow):
             if pixmap.isNull():
                 raise ValueError(f"Could not read {path}")
             boxes = read_labels(self.label_path(path), pixmap.width(), pixmap.height(), len(self.class_names))
+            review_data = load_review_metadata(path) if path.parent == self.dataset_dir / "unlabeled" else None
+            unknown_drafts = 0
+            if review_data is not None:
+                for draft in review_data["boxes"]:
+                    if not isinstance(draft, dict) or not isinstance(draft.get("class_name"), str):
+                        raise ValueError(f"Invalid draft class in {metadata_path(path)}")
+                    if draft["class_name"] not in self.class_names:
+                        unknown_drafts += 1
+                        continue
+                    coords = draft.get("xywhn")
+                    confidence = draft.get("confidence")
+                    if not isinstance(coords, list) or len(coords) != 4 or not all(
+                        isinstance(value, (int, float)) and math.isfinite(value) for value in coords
+                    ) or (confidence is not None and (
+                        not isinstance(confidence, (int, float)) or not math.isfinite(confidence)
+                    )):
+                        raise ValueError(f"Invalid draft box in {metadata_path(path)}")
+                    cx, cy, bw, bh = coords
+                    if not ((confidence is None or 0 <= confidence <= 1) and bw > 0 and bh > 0 and
+                            -0.0001 <= cx - bw / 2 < cx + bw / 2 <= 1.0001 and
+                            -0.0001 <= cy - bh / 2 < cy + bh / 2 <= 1.0001):
+                        raise ValueError(f"Draft box is out of range in {metadata_path(path)}")
+                    candidate = Box(self.class_names.index(draft["class_name"]),
+                                    max(0, (cx - bw / 2) * pixmap.width()),
+                                    max(0, (cy - bh / 2) * pixmap.height()),
+                                    min(pixmap.width(), (cx + bw / 2) * pixmap.width()),
+                                    min(pixmap.height(), (cy + bh / 2) * pixmap.height()),
+                                    suggested=True, confidence=float(confidence) if confidence is not None else None)
+                    if not any(self._box_iou(candidate, existing) > 0.8 and candidate.class_id == existing.class_id
+                               for existing in boxes):
+                        boxes.append(candidate)
             self.canvas.load_image(path, boxes)
         except Exception as exc:
             QMessageBox.warning(self, "Cannot open image", str(exc))
@@ -1174,10 +1231,16 @@ class LabelerWindow(QMainWindow):
             self.image_list.blockSignals(False)
             return
         self.current_path = path
+        self.review_data = review_data
         self.saved_signature = accepted_signature(boxes)
         self.undo_history.clear()
         self.redo_history.clear()
         self.image_title.setText(path.name)
+        reason = review_data.get("selection_reason", "review") if review_data else ""
+        review_text = f"Captured for review: {str(reason).replace('_', ' ')}" if review_data else ""
+        if unknown_drafts:
+            review_text += f" · {unknown_drafts} suggestions with unknown classes skipped"
+        self.review_info.setText(review_text)
         self.refresh_box_list()
         self._save_session()
         self.statusBar().showMessage(f"Editing {path.name}")
@@ -1185,6 +1248,8 @@ class LabelerWindow(QMainWindow):
     def maybe_leave_current(self) -> bool:
         if self.current_path is None:
             return True
+        if self.review_data is not None:
+            return self._sync_review_state()
         if any(box.suggested for box in self.canvas.boxes):
             answer = QMessageBox.question(
                 self, "Unreviewed suggestions",
@@ -1195,6 +1260,31 @@ class LabelerWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return False
         return self.save_current(force=False)
+
+    def _sync_review_state(self) -> bool:
+        if self.current_path is None or self.review_data is None:
+            return True
+        if not self.save_current(force=False):
+            return False
+        width, height = self.canvas.image_width, self.canvas.image_height
+        pending = []
+        for box in self.canvas.boxes:
+            if not box.suggested:
+                continue
+            pending.append({
+                "class_name": self.class_names[box.class_id],
+                "confidence": box.confidence,
+                "xywhn": [(box.x1 + box.x2) / (2 * width), (box.y1 + box.y2) / (2 * height),
+                           (box.x2 - box.x1) / width, (box.y2 - box.y1) / height],
+            })
+        updated = {**self.review_data, "boxes": pending}
+        try:
+            save_review_metadata(self.current_path, updated)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not save review draft", str(exc))
+            return False
+        self.review_data = updated
+        return True
 
     def save_current(self, _checked=False, *, force: bool = True) -> bool:
         if self.current_path is None:
@@ -1240,6 +1330,8 @@ class LabelerWindow(QMainWindow):
             return
         if not self.save_current(force=True):
             return
+        if not self._sync_review_state():
+            return
         image_path = self.current_path
         label_path = self.label_path(image_path)
         destination_images = self.dataset_dir / "labeled" / "images"
@@ -1248,21 +1340,29 @@ class LabelerWindow(QMainWindow):
         destination_labels.mkdir(parents=True, exist_ok=True)
         image_target = destination_images / image_path.name
         label_target = destination_labels / label_path.name
-        if image_target.exists() or label_target.exists():
+        review_source = metadata_path(image_path)
+        review_target = metadata_path(image_target)
+        if image_target.exists() or label_target.exists() or (review_source.exists() and review_target.exists()):
             QMessageBox.warning(self, "Name collision", f"A destination file already exists for {image_path.name}.")
             return
+        moves = [(image_path, image_target), (label_path, label_target)]
+        if review_source.exists():
+            review_target.parent.mkdir(parents=True, exist_ok=True)
+            moves.append((review_source, review_target))
+        completed = []
         try:
-            image_path.rename(image_target)
-            try:
-                label_path.rename(label_target)
-            except OSError:
-                image_target.rename(image_path)
-                raise
+            for source, target in moves:
+                source.rename(target)
+                completed.append((source, target))
         except OSError as exc:
+            for source, target in reversed(completed):
+                target.rename(source)
             QMessageBox.critical(self, "Move failed", str(exc))
             return
         row = self.image_list.currentRow()
         self.current_path = None
+        self.review_data = None
+        self.review_info.clear()
         self.refresh_queue(select_row=row)
         self._save_session()
         self.statusBar().showMessage(f"Moved {image_path.name} and {label_path.name} to labeled")
@@ -1287,7 +1387,7 @@ class LabelerWindow(QMainWindow):
         for index, box in enumerate(self.canvas.boxes):
             text = f"{index + 1:02d}  {self.class_names[box.class_id]}"
             if box.suggested:
-                text += "   · suggestion"
+                text += f"   · {box.confidence:.0%} suggestion" if box.confidence is not None else "   · suggestion"
             item = QListWidgetItem(text)
             item.setForeground(QBrush(QColor(self.class_colors[box.class_id])))
             self.box_list.addItem(item)
@@ -1334,6 +1434,8 @@ class LabelerWindow(QMainWindow):
         if before != self.canvas.boxes:
             self.undo_history.append([replace(box) for box in before])
             self.redo_history.clear()
+            if self.review_data is not None:
+                self._sync_review_state()
         self.refresh_box_list()
 
     def undo(self) -> None:
@@ -1341,6 +1443,8 @@ class LabelerWindow(QMainWindow):
             return
         self.redo_history.append(self.canvas.snapshot())
         self.canvas.set_boxes(self.undo_history.pop())
+        if self.review_data is not None:
+            self._sync_review_state()
         self.refresh_box_list()
 
     def redo(self) -> None:
@@ -1348,6 +1452,8 @@ class LabelerWindow(QMainWindow):
             return
         self.undo_history.append(self.canvas.snapshot())
         self.canvas.set_boxes(self.redo_history.pop())
+        if self.review_data is not None:
+            self._sync_review_state()
         self.refresh_box_list()
 
     def delete_selected(self) -> None:
