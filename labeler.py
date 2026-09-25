@@ -13,8 +13,8 @@ from dataset_project import (
     recent_dataset, remember_dataset,
 )
 from review_metadata import load_review_metadata, metadata_path, save_review_metadata
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -140,6 +140,7 @@ class LabelCanvas(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#111827")))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.class_names = class_names
         self.class_colors = class_colors
         self.boxes: list[Box] = []
@@ -150,6 +151,8 @@ class LabelCanvas(QGraphicsView):
         self.image_height = 0
         self.annotation_items = []
         self.preview_item = None
+        self.horizontal_guide = None
+        self.vertical_guide = None
         self.drag = None
         self.pan_position = None
 
@@ -160,9 +163,12 @@ class LabelCanvas(QGraphicsView):
         self.scene().clear()
         self.annotation_items.clear()
         self.preview_item = None
+        self.horizontal_guide = None
+        self.vertical_guide = None
         self.scene().addPixmap(pixmap)
         self.image_width, self.image_height = pixmap.width(), pixmap.height()
         self.scene().setSceneRect(0, 0, self.image_width, self.image_height)
+        self._create_guides()
         self.boxes = [replace(box) for box in boxes]
         self.select(-1)
         self.redraw()
@@ -171,6 +177,8 @@ class LabelCanvas(QGraphicsView):
     def clear_image(self) -> None:
         self.scene().clear()
         self.annotation_items.clear()
+        self.horizontal_guide = None
+        self.vertical_guide = None
         self.boxes.clear()
         self.image_width = self.image_height = 0
         self.select(-1)
@@ -193,6 +201,38 @@ class LabelCanvas(QGraphicsView):
             self.resetTransform()
             self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
             self.redraw()
+            self._update_guides(self.viewport().mapFromGlobal(QCursor.pos()))
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        position = self.viewport().mapFromGlobal(QCursor.pos())
+        self._update_guides(position)
+
+    def _create_guides(self) -> None:
+        pen = QPen(QColor(255, 255, 255, 170), 1, Qt.PenStyle.DotLine)
+        pen.setCosmetic(True)
+        self.horizontal_guide = self.scene().addLine(0, 0, self.image_width, 0, pen)
+        self.vertical_guide = self.scene().addLine(0, 0, 0, self.image_height, pen)
+        for guide in (self.horizontal_guide, self.vertical_guide):
+            guide.setZValue(1000)
+            guide.hide()
+
+    def _update_guides(self, view_position) -> None:
+        if self.horizontal_guide is None or self.vertical_guide is None:
+            return
+        if self.mode != "draw" or not self.viewport().rect().contains(view_position):
+            self.horizontal_guide.hide()
+            self.vertical_guide.hide()
+            return
+        point = self.mapToScene(view_position)
+        if not (0 <= point.x() <= self.image_width and 0 <= point.y() <= self.image_height):
+            self.horizontal_guide.hide()
+            self.vertical_guide.hide()
+            return
+        self.horizontal_guide.setLine(0, point.y(), self.image_width, point.y())
+        self.vertical_guide.setLine(point.x(), 0, point.x(), self.image_height)
+        self.horizontal_guide.show()
+        self.vertical_guide.show()
 
     def redraw(self) -> None:
         for item in self.annotation_items:
@@ -287,8 +327,10 @@ class LabelCanvas(QGraphicsView):
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             self.pan_position = event.pos()
+            self._update_guides(event.pos())
             event.accept()
             return
+        self._update_guides(event.pos())
         if self.drag is None:
             return super().mouseMoveEvent(event)
         point = self._point(event.pos())
@@ -317,10 +359,23 @@ class LabelCanvas(QGraphicsView):
             self.redraw()
         event.accept()
 
+    def leaveEvent(self, event) -> None:
+        if self.horizontal_guide is not None:
+            self.horizontal_guide.hide()
+            self.vertical_guide.hide()
+        super().leaveEvent(event)
+
+    def viewportEvent(self, event) -> bool:
+        if event.type() == QEvent.Type.Leave and getattr(self, "horizontal_guide", None) is not None:
+            self.horizontal_guide.hide()
+            self.vertical_guide.hide()
+        return super().viewportEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
             self.pan_position = None
             self.unsetCursor()
+            self._update_guides(event.pos())
             event.accept()
             return
         if event.button() != Qt.MouseButton.LeftButton or self.drag is None:
@@ -347,6 +402,7 @@ class LabelCanvas(QGraphicsView):
         if 0.05 <= new_scale <= 20:
             self.scale(factor, factor)
             self.redraw()
+            self._update_guides(self.viewport().mapFromGlobal(QCursor.pos()))
         event.accept()
 
 
@@ -971,7 +1027,7 @@ class LabelerWindow(QMainWindow):
         self.canvas.fit_image()
 
     def set_mode(self, mode: str) -> None:
-        self.canvas.mode = mode
+        self.canvas.set_mode(mode)
         self.draw_button.setChecked(mode == "draw")
         self.select_button.setChecked(mode == "select")
         self.statusBar().showMessage("Draw a new box" if mode == "draw" else "Select, move, or resize a box")
