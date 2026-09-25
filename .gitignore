@@ -31,3 +31,4 @@ venv/
 # Temporary files
 *.tmp
 *.log
+*.zip
