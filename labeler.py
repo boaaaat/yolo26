@@ -209,7 +209,7 @@ class LabelCanvas(QGraphicsView):
         self._update_guides(position)
 
     def _create_guides(self) -> None:
-        pen = QPen(QColor(255, 255, 255, 170), 1, Qt.PenStyle.DotLine)
+        pen = QPen(QColor("#ff4de1"), 2, Qt.PenStyle.DotLine)
         pen.setCosmetic(True)
         self.horizontal_guide = self.scene().addLine(0, 0, self.image_width, 0, pen)
         self.vertical_guide = self.scene().addLine(0, 0, 0, self.image_height, pen)
