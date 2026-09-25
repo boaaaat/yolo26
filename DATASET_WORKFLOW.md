@@ -1,7 +1,7 @@
 # Label and generate datasets
 
 1. Open `labeler.py`. It resumes the last folder and image for that dataset, or starts in `datasets/unlabeled` the first time. Use **Open dataset…** to select a dataset root, then **Open unlabeled** or **Open labeled** to switch folders. Choose **Class: name** in the image queue dropdown to show labeled images containing that class; selecting a class opens the labeled folder automatically.
-2. Draw or edit boxes. **Save** keeps accepted boxes beside the image in `unlabeled`. Frames from `active_collector.py` show dashed suggestions from `.review` metadata; correcting or accepting them preserves your progress when you change images.
+2. Draw or edit boxes. Click a class while a box is selected to change that box's class; otherwise the class is used for new boxes. **Delete image…** (Shift+Delete) moves the selected image and its related files into the dataset's `.trash` folder after confirmation. **Save** keeps accepted boxes beside the image in `unlabeled`. Frames from `active_collector.py` show dashed suggestions from `.review` metadata; correcting or accepting them preserves your progress when you change images.
 3. **Finish → Labeled** moves the reviewed image and its label to `datasets/labeled/images` and `datasets/labeled/labels`. Use **Open labeled** to review or edit it again.
 4. Click **Generate dataset…**. Choose the classes, split percentages, and how many augmented training copies to make. Generation reads only reviewed images and labels in `labeled`.
 

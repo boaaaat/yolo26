@@ -3,6 +3,7 @@
 import math
 import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -853,6 +854,7 @@ class LabelerWindow(QMainWindow):
         self.queue_filter.currentIndexChanged.connect(self.on_queue_filter_changed)
         left_layout.addWidget(self.queue_filter)
         left_layout.addWidget(self._button("Refresh queue", self.refresh_queue_from_button))
+        left_layout.addWidget(self._button("Delete image…  Shift+Del", self.delete_current_image))
         self.image_list = QListWidget()
         self.image_list.currentItemChanged.connect(self.on_image_selected)
         left_layout.addWidget(self.image_list, 1)
@@ -891,7 +893,10 @@ class LabelerWindow(QMainWindow):
         self.class_list.currentRowChanged.connect(self.on_class_selected)
         right_layout.addWidget(self.class_list)
         right_layout.addWidget(self._button("Manage classes…", self.manage_classes))
-        right_layout.addWidget(self._button("Apply class to selected box", self.assign_selected_class))
+        class_hint = QLabel("Click a class to change the selected box, or choose the class for new boxes.")
+        class_hint.setObjectName("muted")
+        class_hint.setWordWrap(True)
+        right_layout.addWidget(class_hint)
         right_layout.addWidget(QLabel("BOXES"))
         self.box_list = QListWidget()
         self.box_list.currentRowChanged.connect(self.on_box_selected)
@@ -917,7 +922,7 @@ class LabelerWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setSizes((270, 890, 300))
 
-        self.statusBar().showMessage("Ready · Ctrl+S save · Ctrl+Z/Y undo/redo · 1–9 choose class")
+        self.statusBar().showMessage("Ready · Ctrl+S save · Ctrl+Z/Y undo/redo · 1–9 set box class")
 
     def _build_shortcuts(self) -> None:
         bindings = {
@@ -927,6 +932,7 @@ class LabelerWindow(QMainWindow):
             "Ctrl+Z": self.undo,
             "Ctrl+Y": self.redo,
             "Delete": self.delete_selected,
+            "Shift+Delete": self.delete_current_image,
             "Return": self.accept_selected,
             "Left": self.previous_image,
             "Right": self.next_image,
@@ -1182,6 +1188,67 @@ class LabelerWindow(QMainWindow):
         row = max(0, self.image_list.currentRow())
         self.current_path = None
         self.refresh_queue(select_row=row)
+
+    def delete_current_image(self) -> None:
+        image_path = self.current_path
+        if image_path is None:
+            return
+        if not self.suggest_button.isEnabled():
+            QMessageBox.information(self, "Suggestion in progress", "Wait for the current suggestion to finish.")
+            return
+        related = [image_path]
+        label_path = self.label_path(image_path)
+        shares_label = any(
+            path != image_path and path.is_file() and path.stem == image_path.stem
+            and path.suffix.lower() in IMAGE_SUFFIXES
+            for path in self.source_dir.iterdir()
+        )
+        if label_path.is_file() and not shares_label:
+            related.append(label_path)
+        review_path = metadata_path(image_path)
+        if review_path.is_file():
+            related.append(review_path)
+        try:
+            relative_paths = [path.relative_to(self.dataset_dir) for path in related]
+        except ValueError:
+            QMessageBox.warning(self, "Cannot delete image", "The selected image is outside this dataset root.")
+            return
+        trash_root = self.dataset_dir / ".trash"
+        answer = QMessageBox.question(
+            self, "Delete image",
+            f"Move {image_path.name} and its associated files to the dataset trash?\n\n{trash_root}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        moved = []
+        trash_dir = None
+        try:
+            trash_root.mkdir(parents=True, exist_ok=True)
+            trash_dir = Path(tempfile.mkdtemp(prefix=f"{image_path.stem}-", dir=trash_root))
+            for source, relative in zip(related, relative_paths):
+                destination = trash_dir / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(destination)
+                moved.append((source, destination))
+        except OSError as exc:
+            rollback_errors = []
+            for source, destination in reversed(moved):
+                try:
+                    destination.rename(source)
+                except OSError as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+            detail = f"\nSome files remain in {trash_dir}." if rollback_errors else ""
+            QMessageBox.critical(self, "Delete failed", f"{exc}{detail}")
+            return
+        row = self.image_list.currentRow()
+        self.current_path = None
+        self.review_data = None
+        self.review_info.clear()
+        self.refresh_queue(select_row=row)
+        self._save_session()
+        self.statusBar().showMessage(f"Moved {image_path.name} to {trash_dir}")
 
     def on_queue_filter_changed(self, *_args) -> None:
         requested = self.queue_filter.currentData()
@@ -1511,19 +1578,13 @@ class LabelerWindow(QMainWindow):
         if index < 0:
             return
         self.canvas.active_class = index
-        self._save_session()
-
-    def assign_selected_class(self) -> None:
-        index = self.canvas.selected
-        class_id = self.class_list.currentRow()
-        if index < 0 or class_id < 0:
-            return
-        box = self.canvas.boxes[index]
-        if box.class_id != class_id:
+        selected = self.canvas.selected
+        if self.current_path is not None and selected >= 0 and self.canvas.boxes[selected].class_id != index:
             before = self.canvas.snapshot()
-            box.class_id = class_id
+            self.canvas.boxes[selected].class_id = index
             self.canvas.redraw()
             self.record_change(before)
+        self._save_session()
 
     def record_change(self, before: list[Box]) -> None:
         if before != self.canvas.boxes:
