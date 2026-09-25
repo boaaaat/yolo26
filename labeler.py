@@ -737,6 +737,7 @@ class LabelerWindow(QMainWindow):
         self.current_path: Path | None = None
         self.review_data: dict | None = None
         self.saved_signature: tuple = ()
+        self.image_class_ids: dict[Path, frozenset[int]] = {}
         self.undo_history: list[list[Box]] = []
         self.redo_history: list[list[Box]] = []
         self.suggestion_thread: QThread | None = None
@@ -847,8 +848,9 @@ class LabelerWindow(QMainWindow):
         self.search.textChanged.connect(self.apply_filter)
         left_layout.addWidget(self.search)
         self.queue_filter = QComboBox()
-        self.queue_filter.addItems(("All images", "Needs labels", "Has labels"))
-        self.queue_filter.currentIndexChanged.connect(self.apply_filter)
+        self._fill_queue_filter()
+        self._last_filter_data = "all"
+        self.queue_filter.currentIndexChanged.connect(self.on_queue_filter_changed)
         left_layout.addWidget(self.queue_filter)
         left_layout.addWidget(self._button("Refresh queue", self.refresh_queue_from_button))
         self.image_list = QListWidget()
@@ -945,6 +947,20 @@ class LabelerWindow(QMainWindow):
             self.class_list.addItem(item)
         self.class_list.blockSignals(False)
 
+    def _fill_queue_filter(self) -> None:
+        selected = self.queue_filter.currentData()
+        self.queue_filter.blockSignals(True)
+        self.queue_filter.clear()
+        self.queue_filter.addItem("All images", "all")
+        self.queue_filter.addItem("Needs labels", "needs_labels")
+        self.queue_filter.addItem("Has labels", "has_labels")
+        self.queue_filter.insertSeparator(self.queue_filter.count())
+        for class_id, name in enumerate(self.class_names):
+            self.queue_filter.addItem(f"Class: {name}", f"class:{class_id}")
+        selected_index = self.queue_filter.findData(selected)
+        self.queue_filter.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self.queue_filter.blockSignals(False)
+
     def canvas_fit_later(self) -> None:
         self.canvas.fit_image()
 
@@ -961,6 +977,18 @@ class LabelerWindow(QMainWindow):
             return preferred
         return sidecar
 
+    def label_class_ids(self, image_path: Path) -> frozenset[int]:
+        label_path = self.label_path(image_path)
+        if not label_path.is_file():
+            return frozenset()
+        try:
+            return frozenset(
+                int(parts[0]) for line in label_path.read_text(encoding="utf-8").splitlines()
+                if (parts := line.split()) and parts[0].isdecimal()
+            )
+        except OSError:
+            return frozenset()
+
     def open_unlabeled(self) -> None:
         self.switch_folder(self.dataset_dir / "unlabeled", dataset_root=self.dataset_dir)
 
@@ -976,7 +1004,7 @@ class LabelerWindow(QMainWindow):
         self.switch_folder(dataset_root / "labeled", dataset_root=dataset_root)
 
     def switch_folder(self, folder: Path, *, restore_state: bool = False,
-                      dataset_root: Path | None = None) -> None:
+                      dataset_root: Path | None = None, queue_filter_data: str = "all") -> None:
         folder = folder.expanduser().resolve()
         dataset_root = find_dataset_root(dataset_root, self.dataset_dir) if dataset_root else find_dataset_root(folder, self.dataset_dir)
         if not self.suggest_button.isEnabled():
@@ -1003,6 +1031,7 @@ class LabelerWindow(QMainWindow):
             self.class_names[:] = project.names
             self.class_colors[:] = project.colors
             self._fill_class_list()
+            self._fill_queue_filter()
             active = min(max(0, project.active_class), len(self.class_names) - 1)
             self.class_list.blockSignals(True)
             self.class_list.setCurrentRow(active)
@@ -1027,8 +1056,14 @@ class LabelerWindow(QMainWindow):
         self.review_info.clear()
         self.canvas.clear_image()
         self.refresh_box_list()
+        self.search.blockSignals(True)
         self.search.clear()
-        self.queue_filter.setCurrentIndex(0)
+        self.search.blockSignals(False)
+        self.queue_filter.blockSignals(True)
+        filter_index = self.queue_filter.findData(queue_filter_data)
+        self.queue_filter.setCurrentIndex(filter_index if filter_index >= 0 else 0)
+        self.queue_filter.blockSignals(False)
+        self._last_filter_data = self.queue_filter.currentData()
         restored_image = self.project.last_image if restore_state else None
         self.refresh_queue(select_row=0, select_name=restored_image)
         self._save_session()
@@ -1062,12 +1097,15 @@ class LabelerWindow(QMainWindow):
         self.class_names[:] = self.project.names
         self.class_colors[:] = self.project.colors
         self._fill_class_list()
+        self._fill_queue_filter()
+        self._last_filter_data = self.queue_filter.currentData()
         self.class_list.blockSignals(True)
         self.class_list.setCurrentRow(selected)
         self.class_list.blockSignals(False)
         self.canvas.active_class = selected
         self.canvas.redraw()
         self.refresh_box_list()
+        self.apply_filter()
         self._save_session()
 
     def _stop_suggestion_worker(self) -> None:
@@ -1096,6 +1134,7 @@ class LabelerWindow(QMainWindow):
             path for path in self.source_dir.iterdir()
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
         )
+        self.image_class_ids = {path: self.label_class_ids(path) for path in images}
         self.image_list.blockSignals(True)
         self.image_list.clear()
         for path in images:
@@ -1144,19 +1183,72 @@ class LabelerWindow(QMainWindow):
         self.current_path = None
         self.refresh_queue(select_row=row)
 
+    def on_queue_filter_changed(self, *_args) -> None:
+        requested = self.queue_filter.currentData()
+        previous = self._last_filter_data
+        if isinstance(requested, str) and requested.startswith("class:") and (
+            self.source_dir != self.dataset_dir / "labeled" / "images"
+        ):
+            self.switch_folder(self.dataset_dir / "labeled", dataset_root=self.dataset_dir,
+                               queue_filter_data=requested)
+            if self.source_dir == self.dataset_dir / "labeled" / "images":
+                return
+        elif self.maybe_leave_current():
+            self._last_filter_data = requested
+            self.apply_filter()
+            self._select_visible_queue_item()
+            return
+        self.queue_filter.blockSignals(True)
+        previous_index = self.queue_filter.findData(previous)
+        self.queue_filter.setCurrentIndex(previous_index if previous_index >= 0 else 0)
+        self.queue_filter.blockSignals(False)
+        self.apply_filter()
+
+    def _select_visible_queue_item(self) -> None:
+        current = self.image_list.currentItem()
+        if current is not None and not current.isHidden():
+            return
+        for index in range(self.image_list.count()):
+            item = self.image_list.item(index)
+            if not item.isHidden():
+                self.image_list.setCurrentItem(item)
+                return
+        self.image_list.blockSignals(True)
+        self.image_list.setCurrentRow(-1)
+        self.image_list.blockSignals(False)
+        self.current_path = None
+        self.review_data = None
+        self.review_info.clear()
+        self.image_title.setText("No images match this filter")
+        self.canvas.clear_image()
+        self.refresh_box_list()
+        self._save_session()
+
     def apply_filter(self, *_args) -> None:
         query = self.search.text().casefold()
-        filter_mode = self.queue_filter.currentIndex()
+        filter_mode = self.queue_filter.currentData()
+        class_id = (int(filter_mode.split(":", 1)[1])
+                    if isinstance(filter_mode, str) and filter_mode.startswith("class:") else None)
+        matching = 0
+        saved_count = 0
         for index in range(self.image_list.count()):
             item = self.image_list.item(index)
             path = Path(item.data(Qt.ItemDataRole.UserRole))
             saved = self.label_path(path).exists()
             visible = query in path.name.casefold()
-            if filter_mode == 1:
+            if filter_mode == "needs_labels":
                 visible = visible and not saved
-            elif filter_mode == 2:
+            elif filter_mode == "has_labels":
                 visible = visible and saved
+            elif class_id is not None:
+                visible = visible and saved and class_id in self.image_class_ids.get(path, frozenset())
             item.setHidden(not visible)
+            matching += visible
+            saved_count += saved
+        if filter_mode == "all" and not query:
+            self.queue_count.setText(f"{self.image_list.count()} images · {saved_count} labeled")
+        else:
+            self.queue_count.setText(f"{matching} matching of {self.image_list.count()} images")
 
     def _update_queue_status(self) -> None:
         saved_count = 0
@@ -1164,11 +1256,14 @@ class LabelerWindow(QMainWindow):
             item = self.image_list.item(index)
             path = Path(item.data(Qt.ItemDataRole.UserRole))
             saved = self.label_path(path).exists()
+            self.image_class_ids[path] = self.label_class_ids(path)
             saved_count += saved
             item.setText(("●  " if saved else "○  ") + path.name)
             item.setForeground(QBrush(QColor("#56d6a5" if saved else "#e5eaf3")))
         self.queue_count.setText(f"{self.image_list.count()} images · {saved_count} labeled")
         self.apply_filter()
+        if isinstance(self.queue_filter.currentData(), str) and self.queue_filter.currentData().startswith("class:"):
+            QTimer.singleShot(0, self._select_visible_queue_item)
 
     def on_image_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         if current is None:
