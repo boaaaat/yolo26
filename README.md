@@ -24,7 +24,13 @@ After generating a dataset version, edit the settings near the top of `train.py`
 python train.py
 ```
 
+Training opens a dashboard in your browser and saves `training_dashboard.html` and `training_dashboard.png` in the run folder. It shows mAP, precision, recall, losses, and learning rate, refreshing after each epoch. With `TRAIN_MODE = "resume"`, the graph loads earlier epochs from that run's `results.csv` before training continues. Set `OPEN_DASHBOARD = False` in `train.py` if you only want the saved files.
+
 To collect gameplay frames for review, set `CHECKPOINT_PATH` and other variables at the top of `active_collector.py`, then run `python active_collector.py`. Press `=` to start collecting, `-` to pause, and Ctrl+C to exit. It runs detection at 1 FPS and saves selected numbered JPGs in `datasets/rivals/unlabeled`. Predictions live in `.review` JSON files until you accept or correct them in the labeler. Refresh the labeler's queue if it was already open.
+
+Before inference, run `python calibrate.py`. Join Rivals, go to the test area, lock the mouse to the center, keep it still, and press `=`. This saves `mouse_calibration.json` with the locked cursor position. If the file is missing or the primary display resolution changes, inference tells you to calibrate again.
+
+To run compiled BF16 inference with enemy aiming, edit `inference_bot.py` and run `python inference_bot.py` on Windows. It uses the primary display and `runs/yolo26m/weights/best.pt` by default. Press `=` to arm, `-` to pause, and Ctrl+C to exit. When several enemies are detected, it aims at the one closest to the calibrated locked cursor position. `AUTO_SHOOT` defaults to `True`; set it to `False` to aim without clicking. `INFERENCE_TARGET_FPS` is a pacing target, and the script reports its measured inference FPS. It requires a CUDA GPU with native BF16 support and a PyTorch build that can compile the model.
 
 Use **Generate dataset…** after finishing a batch of images, then run `train.py` separately. Its default is a new training run from pretrained `yolo26m.pt` on the latest generated dataset version. Set the collector's `CHECKPOINT_PATH` to a new `best.pt` when you decide to use that model.
 

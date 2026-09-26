@@ -4,6 +4,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 
 from dataset_project import latest_generated_version, recent_dataset
+from training_dashboard import TrainingDashboard
 from ultralytics import YOLO
 
 
@@ -21,6 +22,7 @@ RUN_NAME = "yolo26m"
 TRAIN_MODE = "new"  # "new", "resume" an interrupted run, or "continue" a completed run.
 CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "last.pt"
 CONTINUE_RUN_NAME = f"{RUN_NAME}_continue"
+OPEN_DASHBOARD = True  # Open a live browser dashboard; a PNG is also saved in the run folder.
 
 
 def main() -> None:
@@ -46,6 +48,11 @@ def main() -> None:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Training checkpoint not found: {checkpoint}")
         model = YOLO(str(checkpoint))
+
+    dashboard = TrainingDashboard(open_browser=OPEN_DASHBOARD)
+    model.add_callback("on_pretrain_routine_start", dashboard.start)
+    model.add_callback("on_fit_epoch_end", dashboard.update)
+    model.add_callback("on_train_end", dashboard.finish)
 
     if TRAIN_MODE == "resume":
         saved = model.ckpt or {}

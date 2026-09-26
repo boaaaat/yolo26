@@ -14,6 +14,7 @@ venv/
 # Dataset images, annotations, generated versions, and labeler session state
 /datasets/
 /labeler_recent.yaml
+/mouse_calibration.json
 
 # Model downloads, checkpoints, training output, and recordings
 /models/
