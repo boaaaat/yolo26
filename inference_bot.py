@@ -46,6 +46,10 @@ AIM_HEIGHT_FROM_BOTTOM = 0.90  # 90% up the box, or 10% down from its top.
 AIM_TIME_CONSTANT_SECONDS = 0.030
 MOUSE_UPDATE_HZ = 180
 MAX_MOUSE_STEP_PIXELS = 70
+TARGET_LOST_FRAMES = 4  # Hold the lock through short detection gaps.
+TARGET_MATCH_MIN_IOU = 0.10
+TARGET_MATCH_MAX_CENTER_DISTANCE = 0.65  # In units of the larger box diagonal.
+TARGET_MATCH_MAX_AREA_RATIO = 4.0
 
 START_KEY = 0xBB  # = / +
 STOP_KEY = 0xBD  # - / _
@@ -86,6 +90,50 @@ def wait_until(deadline_ns: int, running: threading.Event) -> bool:
     return False
 
 
+BoxCoords = tuple[float, float, float, float]
+
+
+def box_center(box: BoxCoords) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def box_iou(first: BoxCoords, second: BoxCoords) -> float:
+    width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
+    height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
+    intersection = width * height
+    first_area = (first[2] - first[0]) * (first[3] - first[1])
+    second_area = (second[2] - second[0]) * (second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def match_target(previous: BoxCoords, boxes: tuple[BoxCoords, ...]) -> BoxCoords | None:
+    previous_center = box_center(previous)
+    previous_width = previous[2] - previous[0]
+    previous_height = previous[3] - previous[1]
+    previous_area = previous_width * previous_height
+    previous_diagonal = math.hypot(previous_width, previous_height)
+    overlapping: list[tuple[float, float, BoxCoords]] = []
+    nearby: list[tuple[float, BoxCoords]] = []
+    for box in boxes:
+        width, height = box[2] - box[0], box[3] - box[1]
+        area_ratio = width * height / previous_area if previous_area > 0 else 0
+        if not 1 / TARGET_MATCH_MAX_AREA_RATIO <= area_ratio <= TARGET_MATCH_MAX_AREA_RATIO:
+            continue
+        center = box_center(box)
+        distance = math.hypot(center[0] - previous_center[0], center[1] - previous_center[1])
+        overlap = box_iou(previous, box)
+        if overlap >= TARGET_MATCH_MIN_IOU:
+            overlapping.append((overlap, -distance, box))
+        elif distance <= TARGET_MATCH_MAX_CENTER_DISTANCE * max(previous_diagonal, math.hypot(width, height)):
+            nearby.append((distance, box))
+    if overlapping:
+        return max(overlapping, key=lambda item: (item[0], item[1]))[2]
+    if nearby:
+        return min(nearby, key=lambda item: item[0])[1]
+    return None
+
+
 class AimState:
     def __init__(self, locked_center: tuple[int, int]) -> None:
         self.running = threading.Event()
@@ -94,42 +142,58 @@ class AimState:
         self.locked_center = locked_center
         self.aim_delta: tuple[float, float] | None = None
         self.generation = 0
-        self.boxes: tuple[tuple[float, float, float, float], ...] = ()
+        self.target_box: BoxCoords | None = None
+        self.visible_target_box: BoxCoords | None = None
+        self.missed_target_frames = 0
 
-    def set_boxes(self, boxes: tuple[tuple[float, float, float, float], ...]) -> None:
-        if boxes:
-            center_x, center_y = self.locked_center
-            chosen = min(boxes, key=lambda box: (
-                (box[0] + box[2] - 2 * center_x) ** 2
-                + (box[1] + box[3] - 2 * center_y) ** 2
-            ))
-            aim_delta = ((chosen[0] + chosen[2]) / 2 - center_x,
-                         chosen[3] - AIM_HEIGHT_FROM_BOTTOM * (chosen[3] - chosen[1]) - center_y)
-        else:
-            aim_delta = None
+    def set_boxes(self, boxes: tuple[BoxCoords, ...]) -> None:
         with self.lock:
             if not self.running.is_set():
                 return
-            self.boxes = boxes
-            self.aim_delta = aim_delta
+            chosen = match_target(self.target_box, boxes) if self.target_box is not None else None
+            if self.target_box is not None and chosen is None:
+                self.missed_target_frames += 1
+                if self.missed_target_frames >= TARGET_LOST_FRAMES:
+                    self.target_box = None
+                    self.missed_target_frames = 0
+            elif chosen is not None:
+                self.missed_target_frames = 0
+            if self.target_box is None and boxes:
+                center_x, center_y = self.locked_center
+                chosen = min(boxes, key=lambda box: (
+                    (box_center(box)[0] - center_x) ** 2
+                    + (box_center(box)[1] - center_y) ** 2
+                ))
+            self.visible_target_box = chosen
+            if chosen is not None:
+                self.target_box = chosen
+                center_x, center_y = self.locked_center
+                self.aim_delta = (box_center(chosen)[0] - center_x,
+                                  chosen[3] - AIM_HEIGHT_FROM_BOTTOM * (chosen[3] - chosen[1]) - center_y)
+            else:
+                self.aim_delta = None
             self.generation += 1
 
     def pause(self) -> None:
         with self.lock:
             self.running.clear()
-            self.boxes = ()
+            self.target_box = None
+            self.visible_target_box = None
+            self.missed_target_frames = 0
             self.aim_delta = None
             self.generation += 1
 
     def clear(self) -> None:
         with self.lock:
-            self.boxes = ()
+            self.target_box = None
+            self.visible_target_box = None
+            self.missed_target_frames = 0
             self.aim_delta = None
             self.generation += 1
 
     def snapshot(self):
         with self.lock:
-            return self.aim_delta, self.boxes, self.generation
+            return self.aim_delta, self.visible_target_box, self.generation
 
 
 def watch_hotkeys(state: AimState) -> None:
@@ -190,11 +254,14 @@ def aim_loop(state: AimState) -> None:
             if mouse_down and now >= release_at:
                 win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
                 mouse_down = False
-            aim_delta, boxes, generation = state.snapshot()
+            aim_delta, target_box, generation = state.snapshot()
             if generation != last_generation:
                 last_generation = generation
                 remaining_x, remaining_y = aim_delta if aim_delta is not None else (0.0, 0.0)
-            if aim_delta is None or not state.running.is_set():
+            if aim_delta is None or target_box is None or not state.running.is_set():
+                if mouse_down:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    mouse_down = False
                 continue
             gain = 1 - math.exp(-dt / AIM_TIME_CONSTANT_SECONDS)
             desired_x, desired_y = remaining_x * gain, remaining_y * gain
@@ -207,8 +274,8 @@ def aim_loop(state: AimState) -> None:
             remaining_y -= moved_y
             if AUTO_SHOOT and not mouse_down and state.running.is_set() and now >= next_shot:
                 actual_x, actual_y = win32api.GetCursorPos()
-                if any(left <= actual_x <= right and top <= actual_y <= bottom
-                       for left, top, right, bottom in boxes):
+                left, top, right, bottom = target_box
+                if left <= actual_x <= right and top <= actual_y <= bottom:
                     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
                     mouse_down = True
                     release_at = now + round(SHOOT_HOLD_SECONDS * 1_000_000_000)
@@ -332,6 +399,8 @@ def main() -> None:
             0 < AIM_TIME_CONSTANT_SECONDS and MAX_MOUSE_STEP_PIXELS > 0 and
             0 <= AIM_HEIGHT_FROM_BOTTOM <= 1 and 0 < CONFIDENCE < 1 and
             SHOOT_INTERVAL_SECONDS > SHOOT_HOLD_SECONDS > 0 and
+            TARGET_LOST_FRAMES >= 1 and 0 <= TARGET_MATCH_MIN_IOU <= 1 and
+            TARGET_MATCH_MAX_CENTER_DISTANCE > 0 and TARGET_MATCH_MAX_AREA_RATIO >= 1 and
             IMAGE_SIZE > 0 and WARMUP_PASSES > 0):
         raise ValueError("FPS, aim, confidence, or shooting settings are invalid")
     make_dpi_aware()
