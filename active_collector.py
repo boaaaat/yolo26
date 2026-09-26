@@ -19,7 +19,7 @@ from review_metadata import (
 
 
 # Settings
-DATASET_DIR = Path(__file__).resolve().parent / "datasets"
+DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
 DEVICE_INDEX = 0
 OUTPUT_INDEX = 0  # Primary monitor on the selected graphics device.

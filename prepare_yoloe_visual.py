@@ -9,13 +9,12 @@ from PIL import Image
 from torch.nn.functional import normalize
 from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+from dataset_project import latest_generated_version
 
 
 # Change these values here; this script has no command line arguments.
 ROOT = Path(__file__).resolve().parent
-DATA_YAML = ROOT / "datasets" / "data.yaml"
-TRAIN_IMAGES = ROOT / "datasets" / "train" / "images"
-TRAIN_LABELS = ROOT / "datasets" / "train" / "labels"
+DATASET_ROOT = ROOT / "datasets" / "rivals"
 MODEL_PATH = ROOT / "models" / "yoloe-26s-seg.pt"
 PROFILE_PATH = ROOT / "models" / "roblox-yoloe-26s-visual.npz"
 REFERENCES_PER_CLASS = 16
@@ -24,7 +23,10 @@ IMAGE_SIZE = 1024
 
 
 def main() -> None:
-    data = yaml.safe_load(DATA_YAML.read_text(encoding="utf-8"))
+    version = latest_generated_version(DATASET_ROOT)
+    train_images = version / "train" / "images"
+    train_labels = version / "train" / "labels"
+    data = yaml.safe_load((version / "data.yaml").read_text(encoding="utf-8"))
     names = data["names"]
     if isinstance(names, dict):
         names = [value for _, value in sorted(names.items(), key=lambda pair: int(pair[0]))]
@@ -32,9 +34,9 @@ def main() -> None:
         raise FileNotFoundError(MODEL_PATH)
 
     candidates: dict[int, list[tuple[float, Path, np.ndarray]]] = {i: [] for i in range(len(names))}
-    for label_path in TRAIN_LABELS.glob("*.txt"):
-        image_path = next((TRAIN_IMAGES / f"{label_path.stem}{ext}" for ext in (".jpg", ".jpeg", ".png")
-                          if (TRAIN_IMAGES / f"{label_path.stem}{ext}").is_file()), None)
+    for label_path in train_labels.glob("*.txt"):
+        image_path = next((train_images / f"{label_path.stem}{ext}" for ext in (".jpg", ".jpeg", ".png")
+                          if (train_images / f"{label_path.stem}{ext}").is_file()), None)
         if image_path is None:
             continue
         with Image.open(image_path) as image:

@@ -9,7 +9,7 @@ import win32api
 
 
 # Settings
-DATASET_DIR = Path(__file__).resolve().parent / "datasets"
+DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
 OUTPUT_DIR_NAME = "unlabeled"
 IMAGE_SIZE = 1024
 JPEG_QUALITY = 95

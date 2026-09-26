@@ -8,14 +8,14 @@ from pathlib import Path
 import torch
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from dataset_project import latest_generated_version
 
 
 # Edit these values instead of passing command line arguments.
 ROOT = Path(__file__).resolve().parent
 WSL_MODEL_PATH = Path.home() / "models" / "LocateAnything-3B"
 MODEL_PATH = WSL_MODEL_PATH if WSL_MODEL_PATH.is_dir() else ROOT / "models" / "LocateAnything-3B"
-IMAGE_DIR = ROOT / "datasets" / "valid" / "images"
-LABEL_DIR = ROOT / "datasets" / "valid" / "labels"
+DATASET_ROOT = ROOT / "datasets" / "rivals"
 OUTPUT_PATH = ROOT / "models" / "locateanything-roblox-validation.json"
 IMAGE_NAMES = []  # Empty means all validation images; otherwise list image filenames.
 DESCRIPTIONS = ["person"]
@@ -35,7 +35,10 @@ def iou(a: list[float], b: list[float]) -> float:
 
 
 def main() -> None:
-    images = [IMAGE_DIR / name for name in IMAGE_NAMES] if IMAGE_NAMES else sorted(IMAGE_DIR.glob("*.jpg"))
+    version = latest_generated_version(DATASET_ROOT)
+    image_dir = version / "valid" / "images"
+    label_dir = version / "valid" / "labels"
+    images = [image_dir / name for name in IMAGE_NAMES] if IMAGE_NAMES else sorted(image_dir.glob("*.jpg"))
     if any(not path.is_file() for path in images):
         raise FileNotFoundError("One or more IMAGE_NAMES are missing from the validation folder")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
@@ -51,7 +54,7 @@ def main() -> None:
             image = opened.convert("RGB")
         width, height = image.size
         labels = []
-        for line in (LABEL_DIR / f"{image_path.stem}.txt").read_text(encoding="utf-8").splitlines():
+        for line in (label_dir / f"{image_path.stem}.txt").read_text(encoding="utf-8").splitlines():
             class_id, cx, cy, box_width, box_height = map(float, line.split())
             labels.append({"class_id": int(class_id), "xyxy": [
                 (cx - box_width / 2) * width, (cy - box_height / 2) * height,

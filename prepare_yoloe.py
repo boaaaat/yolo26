@@ -9,7 +9,7 @@ from ultralytics import YOLOE
 
 # Edit these prompts if your game's visual cues change, then rerun this script.
 ROOT = Path(__file__).resolve().parent
-DATA_YAML = ROOT / "datasets" / "data.yaml"
+DATA_YAML = ROOT / "datasets" / "rivals" / "data.yaml"
 MODEL_PATH = ROOT / "models" / "yoloe-26s-seg.pt"
 PROMPT_PROFILE_PATH = ROOT / "models" / "roblox-yoloe-26s.npz"
 PROMPTS_BY_CLASS = {

@@ -13,6 +13,7 @@ import yaml
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from review_metadata import (
     SIMILARITY_MAX_DISTANCE, hash_distance, image_difference_hash, load_review_metadata,
+    metadata_path,
 )
 
 
@@ -187,13 +188,21 @@ def _read_boxes(path: Path, class_count: int) -> list[tuple[int, float, float, f
                 raise ValueError("expected five values")
             class_id = int(parts[0])
             cx, cy, width, height = map(float, parts[1:])
-            if not 0 <= class_id < class_count or not all(
-                math.isfinite(value) and 0 <= value <= 1 for value in (cx, cy, width, height)
-            ) or width <= 0 or height <= 0 or not (
-                0 <= cx - width / 2 < cx + width / 2 <= 1
-                and 0 <= cy - height / 2 < cy + height / 2 <= 1
-            ):
-                raise ValueError("class or box coordinates out of range")
+            if not 0 <= class_id < class_count:
+                raise ValueError(f"class ID {class_id} is outside 0–{class_count - 1}")
+            for name, value in zip(("center x", "center y", "width", "height"),
+                                   (cx, cy, width, height)):
+                if not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(f"{name} {value} is outside 0–1")
+            if width <= 0 or height <= 0:
+                raise ValueError("box width and height must be positive")
+            left, right = cx - width / 2, cx + width / 2
+            top, bottom = cy - height / 2, cy + height / 2
+            if left < 0 or right > 1 or top < 0 or bottom > 1:
+                raise ValueError(
+                    f"box extends outside image (left={left:.9f}, top={top:.9f}, "
+                    f"right={right:.9f}, bottom={bottom:.9f})"
+                )
             boxes.append((class_id, cx, cy, width, height))
         except ValueError as exc:
             raise ValueError(f"{path}, line {line_number}: {exc}") from exc
@@ -212,6 +221,45 @@ def _sources(dataset_dir: Path):
                 yield "labeled", image_path, label_path
 
 
+def requeue_invalid_label(dataset_dir: Path, image_path: Path, label_path: Path,
+                          reason: str | None = None) -> tuple[Path, Path]:
+    """Return an image for review and retain its original, invalid label separately."""
+    unlabeled = dataset_dir / "unlabeled"
+    rejected = unlabeled / ".invalid-labels"
+    review_source = metadata_path(image_path)
+    existing_stems = {path.stem.casefold() for path in unlabeled.iterdir() if path.is_file()} if unlabeled.is_dir() else set()
+    index = 0
+    while True:
+        stem = image_path.stem if index == 0 else f"{image_path.stem}-needs-review-{index}"
+        image_target = unlabeled / f"{stem}{image_path.suffix}"
+        label_target = rejected / f"{stem}.txt"
+        issue_target = rejected / f"{stem}.issue.txt"
+        review_target = metadata_path(image_target)
+        if stem.casefold() not in existing_stems and not any(path.exists() for path in (
+            image_target, unlabeled / f"{stem}.txt", label_target, issue_target, review_target,
+        )):
+            break
+        index += 1
+    unlabeled.mkdir(parents=True, exist_ok=True)
+    rejected.mkdir(parents=True, exist_ok=True)
+    moves = [(image_path, image_target), (label_path, label_target)]
+    if review_source.is_file():
+        review_target.parent.mkdir(parents=True, exist_ok=True)
+        moves.append((review_source, review_target))
+    completed = []
+    try:
+        for source, target in moves:
+            source.rename(target)
+            completed.append((source, target))
+    except OSError:
+        for source, target in reversed(completed):
+            target.rename(source)
+        raise
+    if reason is not None:
+        issue_target.write_text(reason + "\n", encoding="utf-8")
+    return image_target, label_target
+
+
 def _image_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as image_file:
@@ -221,7 +269,7 @@ def _image_hash(path: Path) -> str:
 
 
 def _write_boxes(path: Path, boxes: list[tuple[int, float, float, float, float]]) -> None:
-    lines = [f"{class_id} {cx:.6f} {cy:.6f} {width:.6f} {height:.6f}"
+    lines = [f"{class_id} {cx:.10f} {cy:.10f} {width:.10f} {height:.10f}"
              for class_id, cx, cy, width, height in boxes]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
@@ -294,8 +342,9 @@ def generate_dataset(
     dataset_dir: Path, class_names: list[str], config: GenerateConfig,
     progress: Callable[[str], None] | None = None,
     class_colors: list[str] | None = None,
+    issue: Callable[[str], None] | None = None,
 ) -> tuple[Path, dict]:
-    """Build a new immutable version; existing source images and versions are untouched."""
+    """Build a new version and return invalid labels to the review queue."""
     dataset_dir = dataset_dir.expanduser().resolve()
     if not config.included_class_ids or len(set(config.included_class_ids)) != len(config.included_class_ids):
         raise ValueError("Select at least one unique class")
@@ -318,12 +367,22 @@ def generate_dataset(
     seen_hashes = set()
     excluded_only = 0
     duplicates = 0
+    invalid_labels = []
     scanned = 0
     for source_name, image_path, label_path in _sources(dataset_dir):
         scanned += 1
         if progress and scanned % 50 == 0:
             progress(f"Reading source images and labels: {scanned} scanned...")
-        original_boxes = _read_boxes(label_path, len(class_names))
+        try:
+            original_boxes = _read_boxes(label_path, len(class_names))
+        except (ValueError, UnicodeError) as exc:
+            image_target, label_target = requeue_invalid_label(dataset_dir, image_path, label_path, str(exc))
+            message = (f"{exc}\nMoved image to {image_target}; original label saved at {label_target}. "
+                       "Review and label the image again.")
+            invalid_labels.append(message)
+            if issue:
+                issue(message)
+            continue
         boxes = [(remap[class_id], cx, cy, width, height)
                  for class_id, cx, cy, width, height in original_boxes if class_id in remap]
         include_in_version = not (original_boxes and not boxes)
@@ -412,7 +471,8 @@ def generate_dataset(
                 yaml.safe_dump(labeler_data, sort_keys=False), encoding="utf-8")
         metadata = {"source_images": total_split_images, "split_images": split_counts,
                     "augmented_train_images": generated_count, "excluded_only_images": excluded_only,
-                    "duplicate_images": duplicates, "split_conflicts_skipped": split_conflicts,
+                    "duplicate_images": duplicates, "invalid_labels_requeued": len(invalid_labels),
+                    "split_conflicts_skipped": split_conflicts,
                     "seed": 42, "settings": asdict(config)}
         (build_dir / "generation.yaml").write_text(
             yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")

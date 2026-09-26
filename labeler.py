@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from dataset_generator import GenerateConfig, generate_dataset, get_split_percentages
+from dataset_generator import GenerateConfig, _read_boxes, generate_dataset, get_split_percentages
 from dataset_project import (
     DEFAULT_COLORS, DatasetProject, find_dataset_root, load_project,
     recent_dataset, remember_dataset,
@@ -45,7 +45,7 @@ from ultralytics import YOLO, YOLOE
 
 
 # Settings: edit these paths and confidence values for your dataset.
-DATASET_DIR = Path(__file__).resolve().parent / "datasets"
+DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
 YOLOE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "yoloe-26s-seg.pt"
 YOLOE_PROMPT_PROFILE = Path(__file__).resolve().parent / "models" / "roblox-yoloe-26s-visual.npz"
@@ -563,6 +563,7 @@ class ClassManagerDialog(QDialog):
 
 class GenerationWorker(QObject):
     progress = Signal(str)
+    issue = Signal(str)
     finished = Signal(str, object)
     failed = Signal(str)
 
@@ -579,7 +580,7 @@ class GenerationWorker(QObject):
         try:
             path, metadata = generate_dataset(
                 self.dataset_dir, self.class_names, self.config, self.progress.emit,
-                self.class_colors,
+                self.class_colors, self.issue.emit,
             )
             self.finished.emit(str(path), metadata)
         except Exception as exc:
@@ -595,6 +596,7 @@ class DatasetGeneratorDialog(QDialog):
         self.class_colors = project.colors
         self.generation_thread: QThread | None = None
         self.generation_worker: GenerationWorker | None = None
+        self.label_issues: list[str] = []
         self.setWindowTitle("Generate YOLO dataset")
         self.setMinimumWidth(520)
 
@@ -722,6 +724,7 @@ class DatasetGeneratorDialog(QDialog):
         self.test_percent.setText(f"{remaining}%" if remaining > 0 else "Set train + validation below 100%")
 
     def start_generation(self) -> None:
+        self.label_issues.clear()
         included = tuple(index for index, checkbox in enumerate(self.class_checks) if checkbox.isChecked())
         if not included:
             QMessageBox.warning(self, "No classes selected", "Select at least one class.")
@@ -753,6 +756,7 @@ class DatasetGeneratorDialog(QDialog):
         self.generation_worker.moveToThread(self.generation_thread)
         self.generation_thread.started.connect(self.generation_worker.run)
         self.generation_worker.progress.connect(self.progress_label.setText)
+        self.generation_worker.issue.connect(self.on_label_issue)
         self.generation_worker.finished.connect(self.on_generation_finished)
         self.generation_worker.failed.connect(self.on_generation_failed)
         self.generation_worker.finished.connect(self.generation_thread.quit)
@@ -774,10 +778,28 @@ class DatasetGeneratorDialog(QDialog):
             + (" Split assignments were saved in this version, but could not be copied to the dataset root."
                if metadata.get("split_manifest_warning") else "")
         )
+        self._show_label_issues()
 
     def on_generation_failed(self, message: str) -> None:
         self.progress_label.setText(f"Generation failed: {message}")
+        self._show_label_issues()
         QMessageBox.warning(self, "Dataset generation failed", message)
+
+    @Slot(str)
+    def on_label_issue(self, message: str) -> None:
+        self.label_issues.append(message)
+
+    def _show_label_issues(self) -> None:
+        if not self.label_issues:
+            return
+        details = "\n\n".join(self.label_issues)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Labels returned to unlabeled")
+        dialog.setText(f"{len(self.label_issues)} invalid label(s) were returned for review.")
+        dialog.setInformativeText("\n\n".join(self.label_issues[:5]))
+        dialog.setDetailedText(details)
+        dialog.exec()
 
     def on_thread_finished(self) -> None:
         self.generation_thread.deleteLater()
@@ -942,6 +964,7 @@ class LabelerWindow(QMainWindow):
         center_layout.addWidget(self.image_title)
         self.review_info = QLabel()
         self.review_info.setObjectName("muted")
+        self.review_info.setWordWrap(True)
         center_layout.addWidget(self.review_info)
         self.canvas = LabelCanvas(self.class_names, self.class_colors)
         self.canvas.changed.connect(self.record_change)
@@ -1151,6 +1174,8 @@ class LabelerWindow(QMainWindow):
             return
         dialog = DatasetGeneratorDialog(self.project, self)
         dialog.exec()
+        self.current_path = None
+        self.refresh_queue(select_row=0)
 
     def manage_classes(self) -> None:
         if not self.suggest_button.isEnabled():
@@ -1473,6 +1498,9 @@ class LabelerWindow(QMainWindow):
         review_text = f"Captured for review: {str(reason).replace('_', ' ')}" if review_data else ""
         if unknown_drafts:
             review_text += f" · {unknown_drafts} suggestions with unknown classes skipped"
+        issue_path = self.dataset_dir / "unlabeled" / ".invalid-labels" / f"{path.stem}.issue.txt"
+        if path.parent == self.dataset_dir / "unlabeled" and issue_path.is_file():
+            review_text += ("\n" if review_text else "") + "Returned for review: " + issue_path.read_text(encoding="utf-8").strip()
         self.review_info.setText(review_text)
         self.refresh_box_list()
         self._save_session()
@@ -1538,16 +1566,19 @@ class LabelerWindow(QMainWindow):
             cy = (box.y1 + box.y2) / (2 * height)
             bw = (box.x2 - box.x1) / width
             bh = (box.y2 - box.y1) / height
-            lines.append(f"{box.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            lines.append(f"{box.class_id} {cx:.10f} {cy:.10f} {bw:.10f} {bh:.10f}")
         label_path = self.label_path(self.current_path)
         temp_path = label_path.with_suffix(".txt.tmp")
         try:
             label_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            _read_boxes(temp_path, len(self.class_names))
             os.replace(temp_path, label_path)
-        except OSError as exc:
-            QMessageBox.critical(self, "Save failed", str(exc))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
             return False
+        finally:
+            temp_path.unlink(missing_ok=True)
         self.saved_signature = signature
         self._update_queue_status()
         self.statusBar().showMessage(f"Saved {label_path.name}")

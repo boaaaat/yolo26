@@ -186,6 +186,9 @@ def load_project(root: Path) -> DatasetProject:
 
 def find_dataset_root(folder: Path, current_root: Path) -> Path:
     folder = folder.expanduser().resolve()
+    current_root = current_root.expanduser().resolve()
+    if folder == current_root.parent and current_root.name == "rivals":
+        return current_root
     parent_root = _parent_dataset_root(folder)
     if parent_root is not None:
         return parent_root
@@ -206,6 +209,8 @@ def recent_dataset(default_root: Path) -> Path:
             saved = data.get("last_dataset") if isinstance(data, dict) else None
             if isinstance(saved, str) and Path(saved).is_dir():
                 saved_root = Path(saved).expanduser().resolve()
+                if saved_root == default_root.expanduser().resolve().parent:
+                    return default_root.expanduser().resolve()
                 return _parent_dataset_root(saved_root) or saved_root
         except (OSError, yaml.YAMLError):
             pass
@@ -214,3 +219,13 @@ def recent_dataset(default_root: Path) -> Path:
 
 def remember_dataset(root: Path) -> None:
     _atomic_write(RECENT_DATASET_FILE, yaml.safe_dump({"last_dataset": str(root)}, sort_keys=False))
+
+
+def latest_generated_version(root: Path) -> Path:
+    versions_dir = root / "versions"
+    versions = [path for path in versions_dir.iterdir()
+                if path.is_dir() and path.name.startswith("v") and path.name[1:].isdigit()
+                and (path / "data.yaml").is_file()] if versions_dir.is_dir() else []
+    if not versions:
+        raise FileNotFoundError(f"No generated dataset version found in {versions_dir}")
+    return max(versions, key=lambda path: int(path.name[1:]))

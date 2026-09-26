@@ -3,7 +3,7 @@
 from multiprocessing import freeze_support
 from pathlib import Path
 
-from dataset_project import recent_dataset
+from dataset_project import latest_generated_version, recent_dataset
 from ultralytics import YOLO
 
 
@@ -25,17 +25,8 @@ CONTINUE_RUN_NAME = f"{RUN_NAME}_continue"
 
 def main() -> None:
     if DATASET_PATH is None:
-        dataset_root = recent_dataset(Path(__file__).resolve().parent / "datasets")
-        versions_dir = dataset_root / "versions"
-        versions = [path for path in versions_dir.iterdir()
-                    if path.is_dir() and path.name.startswith("v") and path.name[1:].isdigit()
-                    and (path / "data.yaml").is_file()] if versions_dir.is_dir() else []
-        if not versions:
-            raise FileNotFoundError(
-                "No generated dataset found. Use Generate dataset in labeler.py first, "
-                "or set DATASET_PATH to an existing data.yaml."
-            )
-        dataset_path = max(versions, key=lambda path: int(path.name[1:]))
+        dataset_root = recent_dataset(Path(__file__).resolve().parent / "datasets" / "rivals")
+        dataset_path = latest_generated_version(dataset_root)
     else:
         dataset_path = Path(DATASET_PATH).expanduser().resolve()
     data_yaml = dataset_path / "data.yaml" if dataset_path.is_dir() else dataset_path

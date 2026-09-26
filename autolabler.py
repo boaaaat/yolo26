@@ -11,8 +11,8 @@ MODEL_SOURCE = "trained"  # "trained" or "yoloe"; trained is much better on this
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
 YOLOE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "yoloe-26s-seg.pt"
 YOLOE_PROMPT_PROFILE = Path(__file__).resolve().parent / "models" / "roblox-yoloe-26s-visual.npz"
-DATA_YAML = Path(__file__).resolve().parent / "datasets" / "data.yaml"
-IMAGE_DIR = Path(__file__).resolve().parent / "datasets" / "unlabeled"
+DATA_YAML = Path(__file__).resolve().parent / "datasets" / "rivals" / "data.yaml"
+IMAGE_DIR = Path(__file__).resolve().parent / "datasets" / "rivals" / "unlabeled"
 MIN_CONFIDENCE_BY_CLASS = {
     "dead": 0.50,
     "enemy": 0.50,
@@ -47,7 +47,7 @@ def main() -> None:
         raise ValueError("Images with the same name and different extensions would share a label file")
 
     # Ultralytics expects a sibling labels/ folder when images are in images/.
-    # For datasets/unlabeled, labels sit next to their matching images.
+    # For datasets/rivals/unlabeled, labels sit next to their matching images.
     label_dir = image_dir.parent / "labels" if image_dir.name.lower() == "images" else image_dir
     label_dir.mkdir(parents=True, exist_ok=True)
 
