@@ -40,7 +40,7 @@ WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
 AUTO_SHOOT = False
-instant_mouse = True  # Move to the aim point in one mouse event when enabled.
+instant_mouse = False  # Move to the aim point in one mouse event when enabled.
 SHOOT_INTERVAL_SECONDS = 0.10
 SHOOT_HOLD_SECONDS = 0.025
 AIM_HEIGHT_FROM_BOTTOM = 0.90  # 90% up the box, or 10% down from its top.
