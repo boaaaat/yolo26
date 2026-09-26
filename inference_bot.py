@@ -31,7 +31,6 @@ CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weight
 GPU_INDEX = 0
 DXCAM_DEVICE_INDEX = 0
 DXCAM_OUTPUT_INDEX = 0  # Primary display; coordinates below are primary-display coordinates.
-CAPTURE_SIZE = 960  # Centered square crop in screen pixels.
 IMAGE_SIZE = 1024  # Fixed model input; smaller is faster but may miss small targets.
 INFERENCE_TARGET_FPS = 30
 CONFIDENCE = 0.50
@@ -299,12 +298,11 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
         )[0]
 
 
-def enemy_boxes(result, left: int, top: int) -> tuple[tuple[float, float, float, float], ...]:
+def enemy_boxes(result) -> tuple[tuple[float, float, float, float], ...]:
     if result.boxes is None or len(result.boxes) == 0:
         return ()
     coordinates = result.boxes.xyxy.detach().cpu().tolist()
-    return tuple((left + x1, top + y1, left + x2, top + y2)
-                 for x1, y1, x2, y2 in coordinates)
+    return tuple((x1, y1, x2, y2) for x1, y1, x2, y2 in coordinates)
 
 
 def load_locked_center() -> tuple[int, int]:
@@ -334,7 +332,7 @@ def main() -> None:
             0 < AIM_TIME_CONSTANT_SECONDS and MAX_MOUSE_STEP_PIXELS > 0 and
             0 <= AIM_HEIGHT_FROM_BOTTOM <= 1 and 0 < CONFIDENCE < 1 and
             SHOOT_INTERVAL_SECONDS > SHOOT_HOLD_SECONDS > 0 and
-            CAPTURE_SIZE > 0 and IMAGE_SIZE > 0 and WARMUP_PASSES > 0):
+            IMAGE_SIZE > 0 and WARMUP_PASSES > 0):
         raise ValueError("FPS, aim, confidence, or shooting settings are invalid")
     make_dpi_aware()
     locked_center = load_locked_center()
@@ -375,11 +373,7 @@ def main() -> None:
         primary_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
         if (screen_width, screen_height) != (primary_width, primary_height):
             raise ValueError("Selected DXcam output is not the primary display; adjust the output index")
-        side = min(CAPTURE_SIZE, screen_width, screen_height)
-        left = (screen_width - side) // 2
-        top = (screen_height - side) // 2
-        region = (left, top, left + side, top + side)
-        black_frame = np.zeros((side, side, 3), dtype=np.uint8)
+        black_frame = np.zeros_like(full_frame)
         action = "Using cached compiler artifacts and warming" if cache_loaded else "Compiling and warming"
         print(f"{action} {checkpoint.name} on {torch.cuda.get_device_name(GPU_INDEX)}...")
         for _ in range(WARMUP_PASSES):
@@ -414,10 +408,10 @@ def main() -> None:
                         continue
                     if not wait_until(next_frame, state.running):
                         continue
-                    frame = camera.grab(region=region, new_frame_only=False)
+                    frame = camera.grab(new_frame_only=False)
                     if frame is not None:
                         result = predict(model, frame, enemy_ids[0])
-                        state.set_boxes(enemy_boxes(result, left, top))
+                        state.set_boxes(enemy_boxes(result))
                         torch.cuda.synchronize(GPU_INDEX)
                         frames += 1
                     now = time.perf_counter_ns()
