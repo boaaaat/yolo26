@@ -12,6 +12,7 @@ from dataset_project import (
     DEFAULT_COLORS, DatasetProject, find_dataset_root, load_project,
     recent_dataset, remember_dataset,
 )
+from dataset_zip_import import ImportResult, import_dataset_zip
 from review_metadata import load_review_metadata, metadata_path, save_review_metadata
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -300,13 +302,13 @@ class LabelCanvas(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
-            self.pan_position = event.pos()
+            self.pan_position = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
         if event.button() != Qt.MouseButton.LeftButton or not self.image_width:
             return super().mousePressEvent(event)
-        point = self._point(event.pos())
+        point = self._point(event.position().toPoint())
         before = self.snapshot()
         clicked_box = -1
         if self.mode == "draw":
@@ -336,18 +338,19 @@ class LabelCanvas(QGraphicsView):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        view_position = event.position().toPoint()
         if self.pan_position is not None:
-            delta = event.pos() - self.pan_position
+            delta = view_position - self.pan_position
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            self.pan_position = event.pos()
-            self._update_guides(event.pos())
+            self.pan_position = view_position
+            self._update_guides(view_position)
             event.accept()
             return
-        self._update_guides(event.pos())
+        self._update_guides(view_position)
         if self.drag is None:
             return super().mouseMoveEvent(event)
-        point = self._point(event.pos())
+        point = self._point(view_position)
         drag = self.drag
         if drag["kind"] == "draw":
             self.preview_item.setRect(QRectF(drag["start"], point).normalized())
@@ -389,7 +392,7 @@ class LabelCanvas(QGraphicsView):
         if event.button() == Qt.MouseButton.MiddleButton:
             self.pan_position = None
             self.unsetCursor()
-            self._update_guides(event.pos())
+            self._update_guides(event.position().toPoint())
             event.accept()
             return
         if event.button() != Qt.MouseButton.LeftButton or self.drag is None:
@@ -473,6 +476,28 @@ class SuggestionWorker(QObject):
             self.finished.emit(image_path, suggestions)
         except Exception as exc:
             self.failed.emit(image_path, str(exc))
+
+
+class ZipImportWorker(QObject):
+    progress = Signal(int, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, archive_path: Path, dataset_dir: Path, class_names: list[str]) -> None:
+        super().__init__()
+        self.archive_path = archive_path
+        self.dataset_dir = dataset_dir
+        self.class_names = class_names.copy()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = import_dataset_zip(self.archive_path, self.dataset_dir, self.class_names,
+                                        lambda done, total: self.progress.emit(done, total))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
 
 
 class ClassManagerDialog(QDialog):
@@ -836,6 +861,9 @@ class LabelerWindow(QMainWindow):
         self.redo_history: list[list[Box]] = []
         self.suggestion_thread: QThread | None = None
         self.suggestion_worker: SuggestionWorker | None = None
+        self.import_thread: QThread | None = None
+        self.import_worker: ZipImportWorker | None = None
+        self.import_progress: QProgressDialog | None = None
         restored_image = self.project.last_image
         self._build_ui()
         self._build_shortcuts()
@@ -933,6 +961,8 @@ class LabelerWindow(QMainWindow):
         left_layout.addWidget(self._button("Open dataset…", self.open_dataset))
         left_layout.addWidget(self._button("Open unlabeled", self.open_unlabeled))
         left_layout.addWidget(self._button("Open labeled", self.open_labeled))
+        self.import_button = self._button("Import ZIP…", self.import_zip)
+        left_layout.addWidget(self.import_button)
         left_layout.addWidget(self._button("Generate dataset…", self.open_generator))
         self.queue_count = QLabel()
         self.queue_count.setObjectName("muted")
@@ -1105,8 +1135,89 @@ class LabelerWindow(QMainWindow):
         dataset_root = find_dataset_root(self.dataset_dir, self.dataset_dir)
         self.switch_folder(dataset_root / "labeled", dataset_root=dataset_root)
 
+    def import_zip(self) -> None:
+        if self.import_thread is not None:
+            return
+        if not self.suggest_button.isEnabled():
+            QMessageBox.information(self, "Suggestion in progress", "Wait for the current suggestion to finish.")
+            return
+        if not self.maybe_leave_current():
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "Import ZIP into this dataset", str(self.dataset_dir), "ZIP archives (*.zip)"
+        )
+        if not selected:
+            return
+        self.import_button.setEnabled(False)
+        self.import_progress = QProgressDialog(self)
+        self.import_progress.setWindowTitle("Importing dataset ZIP")
+        self.import_progress.setLabelText("Reading archive and matching images with labels…")
+        self.import_progress.setCancelButton(None)
+        self.import_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.import_progress.setMinimumDuration(0)
+        self.import_progress.setAutoClose(False)
+        self.import_progress.setAutoReset(False)
+        self.import_progress.setRange(0, 0)
+        self.import_thread = QThread(self)
+        self.import_worker = ZipImportWorker(Path(selected), self.dataset_dir, self.class_names)
+        self.import_worker.moveToThread(self.import_thread)
+        self.import_thread.started.connect(self.import_worker.run)
+        self.import_worker.progress.connect(self.on_import_progress)
+        self.import_worker.finished.connect(self.on_import_complete)
+        self.import_worker.failed.connect(self.on_import_failed)
+        self.import_worker.finished.connect(self.import_thread.quit)
+        self.import_worker.failed.connect(self.import_thread.quit)
+        self.import_thread.finished.connect(self.import_worker.deleteLater)
+        self.import_thread.finished.connect(self.import_thread.deleteLater)
+        self.import_thread.finished.connect(self.on_import_thread_finished)
+        self.import_progress.show()
+        self.import_thread.start()
+
+    def on_import_progress(self, done: int, total: int) -> None:
+        if self.import_progress is not None:
+            self.import_progress.setRange(0, total)
+            self.import_progress.setValue(done)
+            self.import_progress.setLabelText(
+                "Finalizing imported files…" if done == total else f"Importing image {done} of {total}…"
+            )
+
+    def on_import_complete(self, result: ImportResult) -> None:
+        if self.import_progress is not None:
+            self.import_progress.close()
+        current_name = self.current_path.name if self.current_path else None
+        self.refresh_queue(select_row=max(0, self.image_list.currentRow()), select_name=current_name)
+        details = [f"{result.labeled} labeled images", f"{result.unlabeled} unlabeled images",
+                   f"{result.collector_drafts} collector review files"]
+        if result.issues:
+            details.append(f"{result.issues} images need review in unlabeled")
+        if result.skipped_images:
+            details.append(f"{result.skipped_images} unreadable images skipped")
+        if result.assumed_class_ids:
+            details.append(f"{result.assumed_class_ids} labels used this dataset's class ID order (no source class metadata)")
+        message = "Imported " + ", ".join(details) + f".\n\nOriginal and new filenames: {result.manifest_path}"
+        self.statusBar().showMessage(f"Imported {result.labeled + result.unlabeled} images")
+        QMessageBox.information(self, "ZIP import complete", message)
+
+    def on_import_failed(self, message: str) -> None:
+        if self.import_progress is not None:
+            self.import_progress.close()
+        self.statusBar().showMessage("ZIP import failed")
+        QMessageBox.critical(self, "ZIP import failed", message)
+
+    def on_import_thread_finished(self) -> None:
+        if self.import_progress is not None:
+            self.import_progress.close()
+            self.import_progress.deleteLater()
+            self.import_progress = None
+        self.import_button.setEnabled(True)
+        self.import_worker = None
+        self.import_thread = None
+
     def switch_folder(self, folder: Path, *, restore_state: bool = False,
                       dataset_root: Path | None = None, queue_filter_data: str = "all") -> None:
+        if self.import_thread is not None:
+            QMessageBox.information(self, "Import in progress", "Wait for the ZIP import to finish.")
+            return
         folder = folder.expanduser().resolve()
         dataset_root = find_dataset_root(dataset_root, self.dataset_dir) if dataset_root else find_dataset_root(folder, self.dataset_dir)
         if not self.suggest_button.isEnabled():
@@ -1811,6 +1922,9 @@ class LabelerWindow(QMainWindow):
         self.statusBar().showMessage("Model suggestion failed")
 
     def closeEvent(self, event) -> None:
+        if self.import_thread is not None:
+            event.ignore()
+            return
         if not self.maybe_leave_current():
             event.ignore()
             return
