@@ -13,7 +13,7 @@ from training_dashboard import TrainingDashboard
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
 TEACHER_RUN = RUNS_DIR / "yolo26m"  # Run folder, or its weights/best.pt or weights/last.pt.
-STUDENT_MODEL = "yolo26n.pt"  # Used for a new run. Use "yolo26s.pt" for small.
+STUDENT_MODEL = "yolo26s.pt"  # Used for a new run. Use "yolo26s.pt" for small.
 DATASET_PATH = None  # Use the saved dataset; set a folder or data.yaml path if it moved.
 EPOCHS = 150  # Total epochs for a new run; resume keeps the checkpoint's original total.
 IMAGE_SIZE = None  # Use the teacher run's size for new training or the student checkpoint's size for resume.
@@ -22,7 +22,7 @@ DEVICE = 0
 WORKERS = 4
 DISTILL_WEIGHT = 6.0
 RUN_NAME = None  # Default: <teacher run>-<student model>-distill.
-TRAIN_MODE = "resume"  # "new" or "resume" an interrupted distillation run.
+TRAIN_MODE = "new"  # "new" or "resume" an interrupted distillation run.
 CHECKPOINT_PATH = RUNS_DIR / "yolo26m-yolo26n-distill" / "weights" / "last.pt"  # Set to the interrupted student run.
 OPEN_DASHBOARD = True
 
