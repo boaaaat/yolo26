@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from dataset_generator import GenerateConfig, _read_boxes, generate_dataset, get_split_percentages
+from dataset_browser import DatasetBrowserDialog
 from dataset_project import (
     DEFAULT_COLORS, DatasetProject, find_dataset_root, load_project,
     recent_dataset, remember_dataset,
@@ -48,7 +49,7 @@ from ultralytics import YOLO, YOLOE
 
 # Settings: edit these paths and confidence values for your dataset.
 DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
 YOLOE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "yoloe-26s-seg.pt"
 YOLOE_PROMPT_PROFILE = Path(__file__).resolve().parent / "models" / "roblox-yoloe-26s-visual.npz"
 SUGGESTION_CONFIDENCE_BY_CLASS = {
@@ -68,6 +69,36 @@ DEVICE = 0  # First NVIDIA GPU; use "cpu" if needed.
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MIN_BOX_SIZE = 3.0
+
+
+def training_checkpoints() -> list[Path]:
+    """Find every run, newest first, with its best checkpoint before its last."""
+    if not RUNS_DIR.is_dir():
+        return []
+    checkpoints = []
+    for path in RUNS_DIR.rglob("*.pt"):
+        if path.parent.name == "weights" and path.name in {"best.pt", "last.pt"}:
+            try:
+                checkpoints.append((path, path.stat().st_mtime_ns))
+            except OSError:
+                continue  # A training run may be replacing this file right now.
+    latest_by_run = {}
+    for path, modified in checkpoints:
+        run_dir = path.parent.parent
+        latest_by_run[run_dir] = max(modified, latest_by_run.get(run_dir, 0))
+    checkpoints.sort(key=lambda item: (latest_by_run[item[0].parent.parent],
+                                       item[0].name == "best.pt", item[1]), reverse=True)
+    return [path for path, _ in checkpoints]
+
+
+class RunSelector(QComboBox):
+    def __init__(self, refresh_runs, parent=None) -> None:
+        super().__init__(parent)
+        self.refresh_runs = refresh_runs
+
+    def showPopup(self) -> None:
+        self.refresh_runs()
+        super().showPopup()
 
 
 @dataclass
@@ -435,24 +466,35 @@ class SuggestionWorker(QObject):
     @Slot(str, str)
     def suggest(self, image_path: str, source: str) -> None:
         try:
-            if source not in self.models:
-                if source == "trained":
-                    model = YOLO(str(Path(CHECKPOINT_PATH).expanduser().resolve()))
+            if source == "yoloe":
+                model_path = Path(YOLOE_MODEL_PATH).expanduser().resolve()
+                profile_path = Path(YOLOE_PROMPT_PROFILE).expanduser().resolve()
+                model_stat, profile_stat = model_path.stat(), profile_path.stat()
+                stamp = (model_stat.st_mtime_ns, model_stat.st_size,
+                         profile_stat.st_mtime_ns, profile_stat.st_size)
+            else:
+                model_path = Path(source)
+                model_stat = model_path.stat()
+                stamp = (model_stat.st_mtime_ns, model_stat.st_size)
+            cached = self.models.get(source)
+            if cached is None or cached[0] != stamp:
+                self.models.clear()  # Keep only one model in GPU memory at a time.
+                cached = None
+                if source != "yoloe":
+                    model = YOLO(str(model_path))
                     if model.task != "detect":
                         raise ValueError("Checkpoint must be an object detection model")
-                elif source == "yoloe":
-                    model = YOLOE(str(Path(YOLOE_MODEL_PATH).expanduser().resolve()))
-                    model.load_prompt_embeddings(Path(YOLOE_PROMPT_PROFILE).expanduser().resolve())
                 else:
-                    raise ValueError(f"Unknown suggestion source: {source}")
-                self.models[source] = model
-            model = self.models[source]
+                    model = YOLOE(str(model_path))
+                    model.load_prompt_embeddings(profile_path)
+                self.models[source] = (stamp, model)
+            model = self.models[source][1]
             model_names = model.names
             model_names = dict(model_names.items()) if isinstance(model_names, dict) else dict(enumerate(model_names))
             if not set(model_names.values()).issubset(self.class_names):
                 raise ValueError(f"Model classes {model_names} are not in dataset classes {self.class_names}")
-            thresholds = SUGGESTION_CONFIDENCE_BY_CLASS if source == "trained" else YOLOE_CONFIDENCE_BY_CLASS
-            default_threshold = 0.50 if source == "trained" else 0.25
+            thresholds = YOLOE_CONFIDENCE_BY_CLASS if source == "yoloe" else SUGGESTION_CONFIDENCE_BY_CLASS
+            default_threshold = 0.25 if source == "yoloe" else 0.50
             if any(not isinstance(v, (int, float)) or not 0 <= v <= 1 for v in thresholds.values()):
                 raise ValueError("Suggestion confidence values must be between 0 and 1")
 
@@ -961,6 +1003,7 @@ class LabelerWindow(QMainWindow):
         left_layout.addWidget(self._button("Open dataset…", self.open_dataset))
         left_layout.addWidget(self._button("Open unlabeled", self.open_unlabeled))
         left_layout.addWidget(self._button("Open labeled", self.open_labeled))
+        left_layout.addWidget(self._button("Browse dataset splits…", self.browse_dataset))
         self.import_button = self._button("Import ZIP…", self.import_zip)
         left_layout.addWidget(self.import_button)
         left_layout.addWidget(self._button("Generate dataset…", self.open_generator))
@@ -1035,10 +1078,10 @@ class LabelerWindow(QMainWindow):
         right_layout.addWidget(self._button("Reject all suggestions", self.reject_all))
         right_layout.addSpacing(12)
         right_layout.addWidget(QLabel("SUGGESTION MODEL"))
-        self.suggestion_source = QComboBox()
-        self.suggestion_source.addItem("Trained YOLO26", "trained")
-        self.suggestion_source.addItem("YOLOE-26s · visual prompts (experimental)", "yoloe")
+        self.suggestion_source = RunSelector(self.refresh_suggestion_models)
+        self.refresh_suggestion_models()
         right_layout.addWidget(self.suggestion_source)
+        right_layout.addWidget(self._button("Refresh training runs", self.refresh_suggestion_models))
         self.suggest_button = self._button("Suggest boxes", self.suggest_boxes)
         right_layout.addWidget(self.suggest_button)
         checkpoint_hint = QLabel("Suggestions are dashed. Accept or delete them before finishing. Review every suggested box and class.")
@@ -1078,6 +1121,21 @@ class LabelerWindow(QMainWindow):
             item.setForeground(QBrush(QColor(self.class_colors[index])))
             self.class_list.addItem(item)
         self.class_list.blockSignals(False)
+
+    def refresh_suggestion_models(self) -> None:
+        selected = self.suggestion_source.currentData()
+        self.suggestion_source.blockSignals(True)
+        self.suggestion_source.clear()
+        checkpoints = training_checkpoints()
+        if not checkpoints:
+            self.suggestion_source.addItem("No trained checkpoints found", None)
+        for checkpoint in checkpoints:
+            run = checkpoint.parent.parent.relative_to(RUNS_DIR)
+            self.suggestion_source.addItem(f"{run} · {checkpoint.name}", str(checkpoint))
+        self.suggestion_source.addItem("YOLOE-26s · visual prompts (experimental)", "yoloe")
+        selected_index = self.suggestion_source.findData(selected)
+        self.suggestion_source.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self.suggestion_source.blockSignals(False)
 
     def _fill_queue_filter(self) -> None:
         selected = self.queue_filter.currentData()
@@ -1134,6 +1192,9 @@ class LabelerWindow(QMainWindow):
     def open_labeled(self) -> None:
         dataset_root = find_dataset_root(self.dataset_dir, self.dataset_dir)
         self.switch_folder(dataset_root / "labeled", dataset_root=dataset_root)
+
+    def browse_dataset(self) -> None:
+        DatasetBrowserDialog(self.project, self).exec()
 
     def import_zip(self) -> None:
         if self.import_thread is not None:
@@ -1867,10 +1928,14 @@ class LabelerWindow(QMainWindow):
         if self.current_path is None:
             return
         source = self.suggestion_source.currentData()
-        required = [Path(CHECKPOINT_PATH)] if source == "trained" else [Path(YOLOE_MODEL_PATH), Path(YOLOE_PROMPT_PROFILE)]
+        if source is None:
+            QMessageBox.warning(self, "No training run", f"No best.pt or last.pt was found under {RUNS_DIR}.")
+            return
+        required = ([Path(YOLOE_MODEL_PATH), Path(YOLOE_PROMPT_PROFILE)] if source == "yoloe"
+                    else [Path(source)])
         for path in required:
             if not path.expanduser().resolve().is_file():
-                QMessageBox.warning(self, "Model file missing", f"Set the model paths at the top of labeler.py.\n{path}")
+                QMessageBox.warning(self, "Model file missing", f"Model file not found:\n{path}\nRefresh training runs to update the list.")
                 return
         if self.suggestion_thread is None:
             self.suggestion_thread = QThread(self)

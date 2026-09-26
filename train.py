@@ -50,7 +50,7 @@ def main() -> None:
         model = YOLO(str(checkpoint))
 
     dashboard = TrainingDashboard(open_browser=OPEN_DASHBOARD)
-    model.add_callback("on_pretrain_routine_start", dashboard.start)
+    model.add_callback("on_train_start", dashboard.start)
     model.add_callback("on_fit_epoch_end", dashboard.update)
     model.add_callback("on_train_end", dashboard.finish)
 

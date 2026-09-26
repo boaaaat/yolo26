@@ -16,7 +16,7 @@ Run the labeler from this directory:
 python labeler.py
 ```
 
-The default dataset is `datasets/rivals`, with its own metadata, `labeled`, `unlabeled`, and `versions` folders. Use **Open dataset** to work with another dataset, or **Import ZIP…** to merge labeled images, unlabeled images, and active collector captures into the open dataset with unique filenames. See [DATASET_WORKFLOW.md](DATASET_WORKFLOW.md) for labeling, class management, and dataset generation.
+The default dataset is `datasets/rivals`, with its own metadata, `labeled`, `unlabeled`, and `versions` folders. Use **Open dataset** to work with another dataset, or **Import ZIP…** to merge labeled images, unlabeled images, and active collector captures into the open dataset with unique filenames. **Browse dataset splits…** opens a read-only view of generated versions with label boxes, class and split filters, and filename/class/split sorting. The suggestion model list finds `best.pt` and `last.pt` in every folder under `runs`; reopen the list or use **Refresh training runs** after a new run finishes. See [DATASET_WORKFLOW.md](DATASET_WORKFLOW.md) for labeling, class management, and dataset generation.
 
 After generating a dataset version, edit the settings near the top of `train.py` and run:
 

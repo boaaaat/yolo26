@@ -39,13 +39,13 @@ COMPILE_MODE = "reduce-overhead"
 WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
-AUTO_SHOOT = False
+AUTO_SHOOT = True
 instant_mouse = False  # Move to the aim point in one mouse event when enabled.
 SHOOT_INTERVAL_SECONDS = 0.10
-SHOOT_HOLD_SECONDS = 0.025
+SHOOT_HOLD_SECONDS = 0.09
 AIM_HEIGHT_FROM_BOTTOM = 0.90  # 90% up the box, or 10% down from its top.
 AIM_TIME_CONSTANT_SECONDS = 0.030
-MOUSE_UPDATE_HZ = 120
+MOUSE_UPDATE_HZ = 240
 MAX_MOUSE_STEP_PIXELS = 70
 TARGET_LOST_FRAMES = 4  # Hold the lock through short detection gaps.
 TARGET_MATCH_MIN_IOU = 0.10
