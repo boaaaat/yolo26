@@ -26,6 +26,14 @@ python train.py
 
 Training opens a dashboard in your browser and saves `training_dashboard.html` and `training_dashboard.png` in the run folder. It shows mAP, precision, recall, losses, and learning rate, refreshing after each epoch. With `TRAIN_MODE = "resume"`, the graph loads earlier epochs from that run's `results.csv` before training continues. Set `OPEN_DASHBOARD = False` in `train.py` if you only want the saved files.
 
+To train a smaller model from an existing run with knowledge distillation, edit the settings at the top of `train_distill.py` and run:
+
+```powershell
+python train_distill.py
+```
+
+Set `TEACHER_RUN` to the source run or a specific checkpoint. The script uses its `weights/best.pt` (or `last.pt` if there is no best checkpoint), dataset from `args.yaml`, and image size. `STUDENT_MODEL` defaults to pretrained `yolo26n.pt`; set it to `yolo26s.pt` for small. The other editable settings include `DATASET_PATH`, `EPOCHS`, `BATCH_SIZE`, `DISTILL_WEIGHT`, `RUN_NAME`, and `OPEN_DASHBOARD`. Results go into a new run under `runs/`. To resume an interrupted student run, set `TRAIN_MODE = "resume"` and `CHECKPOINT_PATH` to that run's `weights/last.pt`. Resume restores the saved epoch, optimizer, teacher, and original epoch total; the dashboard reads the existing metrics.
+
 To collect gameplay frames for review, set `CHECKPOINT_PATH` and other variables at the top of `active_collector.py`, then run `python active_collector.py`. Press `=` to start collecting, `-` to pause, and Ctrl+C to exit. It runs detection at 1 FPS and saves selected numbered JPGs in `datasets/rivals/unlabeled`. Predictions live in `.review` JSON files until you accept or correct them in the labeler. Refresh the labeler's queue if it was already open.
 
 Before inference, run `python calibrate.py`. Join Rivals, go to the test area, lock the mouse to the center, keep it still, and press `=`. This saves `mouse_calibration.json` with the locked cursor position. If the file is missing or the primary display resolution changes, inference tells you to calibrate again.

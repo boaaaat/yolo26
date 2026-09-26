@@ -33,7 +33,6 @@ REVIEW_CONFIDENCE_HIGH = 0.80
 MIN_SECONDS_BETWEEN_SAVES = 3
 MAX_SAVES_PER_SESSION = 150
 WEAK_SAMPLE_SECONDS = 20
-EMPTY_SAMPLE_SECONDS = 60
 HIGH_CONFIDENCE_SAMPLE_SECONDS = 120
 RECENT_HASH_COUNT = 50
 DUPLICATE_HASH_DISTANCE = 5  # 64-bit difference hash; lower values reject fewer frames.
@@ -62,11 +61,11 @@ def starting_number(dataset_dir: Path) -> tuple[int, set[int]]:
 
 
 def choose_reason(confidences: list[float], now: float, last_reason_saved: dict[str, float]) -> str | None:
+    if not confidences:
+        return None
     if any(REVIEW_CONFIDENCE_LOW <= value <= REVIEW_CONFIDENCE_HIGH for value in confidences):
         return "uncertain"
-    if not confidences:
-        reason, interval = "empty", EMPTY_SAMPLE_SECONDS
-    elif any(value < REVIEW_CONFIDENCE_LOW for value in confidences):
+    if any(value < REVIEW_CONFIDENCE_LOW for value in confidences):
         reason, interval = "weak", WEAK_SAMPLE_SECONDS
     else:
         reason, interval = "high_confidence_audit", HIGH_CONFIDENCE_SAMPLE_SECONDS
@@ -132,8 +131,8 @@ def main() -> None:
     recent_hashes: deque[int] = deque(maxlen=RECENT_HASH_COUNT)
     last_saved_at = float("-inf")
     started_at = time.monotonic()
-    last_reason_saved = {"empty": started_at, "weak": started_at,
-                         "high_confidence_audit": started_at, "uncertain": float("-inf")}
+    last_reason_saved = {"weak": started_at, "high_confidence_audit": started_at,
+                         "uncertain": float("-inf")}
     saved_count = 0
     collecting = False
     next_due = started_at

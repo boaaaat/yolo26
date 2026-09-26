@@ -162,7 +162,6 @@ def folder_layout(folder: Path) -> tuple[Path, Path]:
 class LabelCanvas(QGraphicsView):
     changed = Signal(object)  # Snapshot before an edit, for undo.
     selection_changed = Signal(int)
-    mode_change_requested = Signal(str)
 
     def __init__(self, class_names: list[str], class_colors: list[str]) -> None:
         super().__init__()
@@ -341,15 +340,6 @@ class LabelCanvas(QGraphicsView):
             return super().mousePressEvent(event)
         point = self._point(event.position().toPoint())
         before = self.snapshot()
-        clicked_box = -1
-        if self.mode == "draw":
-            clicked_box = next(
-                (index for index in range(len(self.boxes) - 1, -1, -1)
-                 if self.boxes[index].rect().contains(point)),
-                -1,
-            )
-            if clicked_box >= 0:
-                self.mode_change_requested.emit("select")
         if self.mode == "draw":
             self.drag = {"kind": "draw", "start": point, "before": before}
             preview_pen = QPen(QColor("#ffffff"), 1)
@@ -357,8 +347,6 @@ class LabelCanvas(QGraphicsView):
             self.preview_item = self.scene().addRect(QRectF(point, point), preview_pen)
         else:
             index, handle = self._hit(point)
-            if clicked_box >= 0:
-                index, handle = clicked_box, None
             self.select(index)
             if index >= 0:
                 self.drag = {
@@ -980,7 +968,7 @@ class LabelerWindow(QMainWindow):
         mode_group.addButton(self.draw_button)
         mode_group.addButton(self.select_button)
         self.draw_button.setChecked(True)
-        toolbar.addWidget(self._button("Fit image", self.canvas_fit_later))
+        toolbar.addWidget(self._button("Fit image  Space", self.canvas_fit_later))
         toolbar.addStretch()
         toolbar.addWidget(self._button("Undo", self.undo))
         toolbar.addWidget(self._button("Redo", self.redo))
@@ -1043,7 +1031,6 @@ class LabelerWindow(QMainWindow):
         self.canvas = LabelCanvas(self.class_names, self.class_colors)
         self.canvas.changed.connect(self.record_change)
         self.canvas.selection_changed.connect(self.on_canvas_selection)
-        self.canvas.mode_change_requested.connect(self.set_mode)
         center_layout.addWidget(self.canvas, 1)
         hint = QLabel("Draw: drag a box  ·  Select: drag to move, use white handles to resize  ·  Wheel: zoom  ·  Middle drag: pan")
         hint.setObjectName("muted")
@@ -1097,6 +1084,7 @@ class LabelerWindow(QMainWindow):
         bindings = {
             "B": lambda: self.set_mode("draw"),
             "V": lambda: self.set_mode("select"),
+            "Space": self.canvas_fit_later,
             "Ctrl+S": self.save_current,
             "Ctrl+Z": self.undo,
             "Ctrl+Y": self.redo,
