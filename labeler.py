@@ -465,10 +465,11 @@ class SuggestionWorker(QObject):
                 for predicted in result.boxes:
                     model_class_id = int(predicted.cls.item())
                     class_name = model_names[model_class_id]
-                    if float(predicted.conf.item()) < thresholds.get(class_name, default_threshold):
+                    confidence = float(predicted.conf.item())
+                    if confidence < thresholds.get(class_name, default_threshold):
                         continue
                     dataset_class_id = self.class_names.index(class_name)
-                    suggestions.append((dataset_class_id, *predicted.xywhn[0].tolist()))
+                    suggestions.append((dataset_class_id, *predicted.xywhn[0].tolist(), confidence))
             self.finished.emit(image_path, suggestions)
         except Exception as exc:
             self.failed.emit(image_path, str(exc))
@@ -1001,6 +1002,7 @@ class LabelerWindow(QMainWindow):
         right_layout.addWidget(self._button("Delete selected  Del", self.delete_selected))
         right_layout.addWidget(self._button("Accept selected  Enter", self.accept_selected))
         right_layout.addWidget(self._button("Accept all suggestions", self.accept_all))
+        right_layout.addWidget(self._button("Reject all suggestions", self.reject_all))
         right_layout.addSpacing(12)
         right_layout.addWidget(QLabel("SUGGESTION MODEL"))
         self.suggestion_source = QComboBox()
@@ -1741,6 +1743,15 @@ class LabelerWindow(QMainWindow):
         self.canvas.redraw()
         self.record_change(before)
 
+    def reject_all(self) -> None:
+        if not any(box.suggested for box in self.canvas.boxes):
+            return
+        before = self.canvas.snapshot()
+        rejected = sum(box.suggested for box in before)
+        self.canvas.set_boxes([box for box in before if not box.suggested])
+        self.record_change(before)
+        self.statusBar().showMessage(f"Rejected {rejected} suggestions")
+
     def suggest_boxes(self) -> None:
         if self.current_path is None:
             return
@@ -1770,12 +1781,12 @@ class LabelerWindow(QMainWindow):
         width, height = self.canvas.image_width, self.canvas.image_height
         before = self.canvas.snapshot()
         added = 0
-        for class_id, cx, cy, bw, bh in predictions:
+        for class_id, cx, cy, bw, bh, confidence in predictions:
             x1, y1 = max(0, (cx - bw / 2) * width), max(0, (cy - bh / 2) * height)
             x2, y2 = min(width, (cx + bw / 2) * width), min(height, (cy + bh / 2) * height)
             if x2 - x1 < MIN_BOX_SIZE or y2 - y1 < MIN_BOX_SIZE:
                 continue
-            candidate = Box(class_id, x1, y1, x2, y2, suggested=True)
+            candidate = Box(class_id, x1, y1, x2, y2, suggested=True, confidence=confidence)
             if any(self._box_iou(candidate, existing) > 0.8 and candidate.class_id == existing.class_id
                    for existing in self.canvas.boxes):
                 continue
