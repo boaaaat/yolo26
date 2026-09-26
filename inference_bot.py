@@ -1,4 +1,4 @@
-"""BF16, compiled YOLO inference with smooth enemy aiming on the primary display.
+"""BF16, compiled YOLO inference with configurable enemy aiming on the primary display.
 
 Press = to arm, - to pause, and Ctrl+C to exit. Settings are below.
 """
@@ -39,12 +39,13 @@ COMPILE_MODE = "reduce-overhead"
 WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
-AUTO_SHOOT = True
+AUTO_SHOOT = False
+instant_mouse = True  # Move to the aim point in one mouse event when enabled.
 SHOOT_INTERVAL_SECONDS = 0.10
 SHOOT_HOLD_SECONDS = 0.025
 AIM_HEIGHT_FROM_BOTTOM = 0.90  # 90% up the box, or 10% down from its top.
 AIM_TIME_CONSTANT_SECONDS = 0.030
-MOUSE_UPDATE_HZ = 180
+MOUSE_UPDATE_HZ = 120
 MAX_MOUSE_STEP_PIXELS = 70
 TARGET_LOST_FRAMES = 4  # Hold the lock through short detection gaps.
 TARGET_MATCH_MIN_IOU = 0.10
@@ -212,11 +213,11 @@ def watch_hotkeys(state: AimState) -> None:
         state.shutdown.wait(HOTKEY_POLL_SECONDS)
 
 
-def move_mouse(dx: float, dy: float) -> tuple[int, int]:
+def move_mouse(dx: float, dy: float, *, instant: bool = False) -> tuple[int, int]:
     distance = math.hypot(dx, dy)
     if distance < 0.5:
         return 0, 0
-    scale = min(1.0, MAX_MOUSE_STEP_PIXELS / distance)
+    scale = 1.0 if instant else min(1.0, MAX_MOUSE_STEP_PIXELS / distance)
     step_x = round(dx * scale)
     step_y = round(dy * scale)
     if not step_x and abs(dx) >= 0.5:
@@ -263,15 +264,21 @@ def aim_loop(state: AimState) -> None:
                     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
                     mouse_down = False
                 continue
-            gain = 1 - math.exp(-dt / AIM_TIME_CONSTANT_SECONDS)
-            desired_x, desired_y = remaining_x * gain, remaining_y * gain
+            if instant_mouse:
+                desired_x, desired_y = remaining_x, remaining_y
+            else:
+                gain = 1 - math.exp(-dt / AIM_TIME_CONSTANT_SECONDS)
+                desired_x, desired_y = remaining_x * gain, remaining_y * gain
             if abs(remaining_x) >= 0.5 and abs(desired_x) < 0.5:
                 desired_x = math.copysign(0.5, remaining_x)
             if abs(remaining_y) >= 0.5 and abs(desired_y) < 0.5:
                 desired_y = math.copysign(0.5, remaining_y)
-            moved_x, moved_y = move_mouse(desired_x, desired_y)
-            remaining_x -= moved_x
-            remaining_y -= moved_y
+            moved_x, moved_y = move_mouse(desired_x, desired_y, instant=instant_mouse)
+            if instant_mouse:
+                remaining_x = remaining_y = 0.0
+            else:
+                remaining_x -= moved_x
+                remaining_y -= moved_y
             if AUTO_SHOOT and not mouse_down and state.running.is_set() and now >= next_shot:
                 actual_x, actual_y = win32api.GetCursorPos()
                 left, top, right, bottom = target_box
@@ -453,7 +460,7 @@ def main() -> None:
         if not cache_loaded:
             save_compiled_cache(cache_path)
         print(f"Ready: BF16 + compiled model, {IMAGE_SIZE}px input, {INFERENCE_TARGET_FPS} FPS target.")
-        print("Press = to arm, - to pause, Ctrl+C to exit. Auto shoot:", AUTO_SHOOT)
+        print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
 
         print(f"Calibrated locked cursor: {locked_center}")
         state = AimState(locked_center)
