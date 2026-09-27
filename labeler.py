@@ -948,7 +948,6 @@ class VideoDialog(QDialog):
         }):
             self._initial_seek_done = True
             self.player.setPosition(min(self._initial_seek_ms, self.player.duration()))
-            self.player.play()
 
     def on_playback_state_changed(self, state) -> None:
         self.play_button.setText("Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
