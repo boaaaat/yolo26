@@ -497,11 +497,11 @@ def main() -> None:
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
 
         if draw_boxes_overlay:
-            from inference_overlay import DetectionOverlay
+            from inference_overlay import DetectionOverlay, OVERLAY_FPS
 
             overlay = DetectionOverlay(screen_width, screen_height)
             overlay.start()
-            print(f"Detection overlay enabled (follows inference at up to {INFERENCE_TARGET_FPS} FPS).")
+            print(f"Detection overlay enabled (up to {OVERLAY_FPS} redraws/second).")
 
         collector = None
         if collect_data:
