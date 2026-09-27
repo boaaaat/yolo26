@@ -35,6 +35,8 @@ IMAGE_SIZE = 1024  # Fixed model input; smaller is faster but may miss small tar
 INFERENCE_TARGET_FPS = 60
 CONFIDENCE = 0.50
 ENEMY_CLASS_NAME = "enemy"
+PREDICT_NMS = None  # None uses the checkpoint's default head; False selects YOLO26's NMS-free head.
+REPORT_STAGE_TIMES = False
 PRECISION = "bf16"  # The FP32 entry point overrides this for Pascal GPUs.
 COMPILE_MODE = "reduce-overhead"
 WARMUP_PASSES = 3
@@ -370,6 +372,7 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
             conf=CONFIDENCE,
             classes=[enemy_class_id],
             max_det=20,
+            nms=PREDICT_NMS,
             compile=COMPILE_MODE,
             quantize=32,
             verbose=False,
@@ -492,6 +495,8 @@ def main() -> None:
             next_frame = time.perf_counter_ns()
             report_start = next_frame
             frames = 0
+            stage_ms = {"frame": 0.0, "capture": 0.0, "preprocess": 0.0,
+                        "inference": 0.0, "postprocess": 0.0}
             try:
                 while True:
                     if not hotkeys.is_alive() or not mouse.is_alive():
@@ -500,20 +505,32 @@ def main() -> None:
                         state.shutdown.wait(0.01)
                         next_frame = report_start = time.perf_counter_ns()
                         frames = 0
+                        stage_ms = {key: 0.0 for key in stage_ms}
                         continue
                     if not wait_until(next_frame, state.running):
                         continue
+                    capture_start = time.perf_counter_ns()
                     frame = camera.grab(new_frame_only=False)
                     if frame is not None:
+                        if REPORT_STAGE_TIMES:
+                            stage_ms["capture"] += (time.perf_counter_ns() - capture_start) / 1_000_000
                         result = predict(model, frame, enemy_ids[0])
                         state.set_boxes(enemy_boxes(result))
-                        torch.cuda.synchronize(GPU_INDEX)
+                        if REPORT_STAGE_TIMES:
+                            for key in ("preprocess", "inference", "postprocess"):
+                                stage_ms[key] += result.speed[key]
+                            stage_ms["frame"] += (time.perf_counter_ns() - capture_start) / 1_000_000
                         frames += 1
                     now = time.perf_counter_ns()
                     if now - report_start >= 5_000_000_000:
                         actual_fps = frames * 1_000_000_000 / (now - report_start)
                         print(f"Actual inference: {actual_fps:.1f} FPS (target {INFERENCE_TARGET_FPS})")
+                        if REPORT_STAGE_TIMES and frames:
+                            print("Average stage time: " + ", ".join(
+                                f"{key} {stage_ms[key] / frames:.1f} ms" for key in stage_ms
+                            ))
                         report_start, frames = now, 0
+                        stage_ms = {key: 0.0 for key in stage_ms}
                     next_frame = max(next_frame + period_ns, now)
             except KeyboardInterrupt:
                 print("Bot stopped.")

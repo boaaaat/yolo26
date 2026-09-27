@@ -14,10 +14,12 @@ CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weight
 GPU_INDEX = 0
 DXCAM_DEVICE_INDEX = 0
 DXCAM_OUTPUT_INDEX = 0
-IMAGE_SIZE = 1024  # Reduce to 512 if the GPU runs out of memory.
+IMAGE_SIZE = 1024  # Keep the full 1024x1024 model input.
 INFERENCE_TARGET_FPS = 30  # Pacing target; actual FPS depends on the GPU and model.
 CONFIDENCE = 0.50
 ENEMY_CLASS_NAME = "enemy"
+NMS_FREE = True  # Use YOLO26's one-to-one head and skip non-maximum suppression.
+REPORT_STAGE_TIMES = True  # Show capture, preprocessing, model, and postprocessing costs.
 WARMUP_PASSES = 2
 
 AUTO_SHOOT = True
@@ -33,6 +35,8 @@ def main() -> None:
     bot.INFERENCE_TARGET_FPS = INFERENCE_TARGET_FPS
     bot.CONFIDENCE = CONFIDENCE
     bot.ENEMY_CLASS_NAME = ENEMY_CLASS_NAME
+    bot.PREDICT_NMS = False if NMS_FREE else None
+    bot.REPORT_STAGE_TIMES = REPORT_STAGE_TIMES
     bot.WARMUP_PASSES = WARMUP_PASSES
     bot.AUTO_SHOOT = AUTO_SHOOT
     bot.instant_mouse = instant_mouse
