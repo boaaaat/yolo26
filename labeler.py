@@ -15,8 +15,10 @@ from dataset_project import (
 )
 from dataset_zip_import import ImportResult, import_dataset_zip
 from review_metadata import load_review_metadata, metadata_path, save_review_metadata
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtMultimedia import QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -41,6 +43,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -871,6 +874,100 @@ class DatasetGeneratorDialog(QDialog):
             event.accept()
 
 
+class VideoDialog(QDialog):
+    def __init__(self, video_path: Path, frame_index: int, fps: float, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Video · {video_path.name}")
+        self.resize(1000, 760)
+        self.setMinimumSize(640, 480)
+        self._seeking = False
+        self._initial_seek_ms = round(frame_index * 1000 / fps)
+        self._initial_seek_done = False
+
+        layout = QVBoxLayout(self)
+        self.video_widget = QVideoWidget(self)
+        layout.addWidget(self.video_widget, 1)
+
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.play_button.clicked.connect(self.toggle_playback)
+        controls.addWidget(self.play_button)
+        self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.sliderPressed.connect(self.begin_seek)
+        self.position_slider.sliderReleased.connect(self.finish_seek)
+        controls.addWidget(self.position_slider, 1)
+        self.time_label = QLabel("0:00 / 0:00")
+        controls.addWidget(self.time_label)
+        exit_button = QPushButton("Exit video  X")
+        exit_button.clicked.connect(self.accept)
+        controls.addWidget(exit_button)
+        layout.addLayout(controls)
+
+        self.player = QMediaPlayer(self)
+        self.player.setVideoOutput(self.video_widget)
+        self.player.positionChanged.connect(self.on_position_changed)
+        self.player.durationChanged.connect(self.on_duration_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
+        self.player.errorOccurred.connect(self.on_player_error)
+        self.player.setSource(QUrl.fromLocalFile(str(video_path)))
+
+        close_shortcut = QShortcut(QKeySequence("X"), self)
+        close_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        close_shortcut.activated.connect(self.accept)
+
+    @staticmethod
+    def format_time(milliseconds: int) -> str:
+        seconds = max(0, milliseconds // 1000)
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def begin_seek(self) -> None:
+        self._seeking = True
+
+    def finish_seek(self) -> None:
+        self.player.setPosition(self.position_slider.value())
+        self._seeking = False
+
+    def on_position_changed(self, position: int) -> None:
+        if not self._seeking:
+            self.position_slider.setValue(position)
+        self.time_label.setText(
+            f"{self.format_time(position)} / {self.format_time(self.player.duration())}"
+        )
+
+    def on_duration_changed(self, duration: int) -> None:
+        self.position_slider.setRange(0, max(0, duration))
+        self.time_label.setText(
+            f"{self.format_time(self.player.position())} / {self.format_time(duration)}"
+        )
+
+    def on_media_status_changed(self, status) -> None:
+        if (not self._initial_seek_done and status in {
+                QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia,
+        }):
+            self._initial_seek_done = True
+            self.player.setPosition(min(self._initial_seek_ms, self.player.duration()))
+            self.player.play()
+
+    def on_playback_state_changed(self, state) -> None:
+        self.play_button.setText("Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
+
+    def on_player_error(self, _error, message: str) -> None:
+        if message:
+            self.time_label.setText(f"Video playback error: {message}")
+
+    def toggle_playback(self) -> None:
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def done(self, result: int) -> None:
+        self.player.stop()
+        super().done(result)
+
+
 class LabelerWindow(QMainWindow):
     request_suggestions = Signal(str, str)
 
@@ -884,6 +981,7 @@ class LabelerWindow(QMainWindow):
         self.source_dir, self.labels_dir = folder_layout(restored_folder)
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.current_path: Path | None = None
+        self.current_video: tuple[Path, int, float] | None = None
         self.review_data: dict | None = None
         self.saved_signature: tuple = ()
         self.image_class_ids: dict[Path, frozenset[int]] = {}
@@ -969,6 +1067,9 @@ class LabelerWindow(QMainWindow):
         mode_group.addButton(self.select_button)
         self.draw_button.setChecked(True)
         toolbar.addWidget(self._button("Fit image  Space", self.canvas_fit_later))
+        self.see_video_button = self._button("See video", self.open_video)
+        self.see_video_button.setEnabled(False)
+        toolbar.addWidget(self.see_video_button)
         toolbar.addStretch()
         toolbar.addWidget(self._button("Undo", self.undo))
         toolbar.addWidget(self._button("Redo", self.redo))
@@ -1154,6 +1255,31 @@ class LabelerWindow(QMainWindow):
         if preferred.exists() or not sidecar.exists():
             return preferred
         return sidecar
+
+    def video_reference(self, metadata: dict | None) -> tuple[Path, int, float] | None:
+        if not metadata or not isinstance(metadata.get("video"), dict):
+            return None
+        video = metadata["video"]
+        relative_path = video.get("path")
+        frame_index = video.get("frame_index")
+        fps = video.get("fps")
+        if (not isinstance(relative_path, str) or not relative_path or
+                not isinstance(frame_index, int) or frame_index < 0 or
+                not isinstance(fps, (int, float)) or fps <= 0):
+            return None
+        candidate = (self.dataset_dir / relative_path).resolve()
+        try:
+            candidate.relative_to(self.dataset_dir.resolve())
+        except ValueError:
+            return None
+        return (candidate, frame_index, float(fps)) if candidate.is_file() else None
+
+    def open_video(self) -> None:
+        if self.current_video is None:
+            return
+        video_path, frame_index, fps = self.current_video
+        dialog = VideoDialog(video_path, frame_index, fps, self)
+        dialog.exec()
 
     def label_class_ids(self, image_path: Path) -> frozenset[int]:
         label_path = self.label_path(image_path)
@@ -1609,7 +1735,8 @@ class LabelerWindow(QMainWindow):
             if pixmap.isNull():
                 raise ValueError(f"Could not read {path}")
             boxes = read_labels(self.label_path(path), pixmap.width(), pixmap.height(), len(self.class_names))
-            review_data = load_review_metadata(path) if path.parent == self.dataset_dir / "unlabeled" else None
+            image_metadata = load_review_metadata(path)
+            review_data = image_metadata if path.parent == self.dataset_dir / "unlabeled" else None
             unknown_drafts = 0
             if review_data is not None:
                 for draft in review_data["boxes"]:
@@ -1651,6 +1778,8 @@ class LabelerWindow(QMainWindow):
             self.image_list.blockSignals(False)
             return
         self.current_path = path
+        self.current_video = self.video_reference(image_metadata)
+        self.see_video_button.setEnabled(self.current_video is not None)
         self.review_data = review_data
         self.saved_signature = accepted_signature(boxes)
         self.undo_history.clear()
@@ -1660,6 +1789,10 @@ class LabelerWindow(QMainWindow):
         review_text = f"Captured for review: {str(reason).replace('_', ' ')}" if review_data else ""
         if unknown_drafts:
             review_text += f" · {unknown_drafts} suggestions with unknown classes skipped"
+        if self.current_video is not None:
+            video_path, frame_index, fps = self.current_video
+            video_text = f"Video: {video_path.name} · frame {frame_index} at {fps:g} FPS"
+            review_text += ("\n" if review_text else "") + video_text
         issue_path = self.dataset_dir / "unlabeled" / ".invalid-labels" / f"{path.stem}.issue.txt"
         if path.parent == self.dataset_dir / "unlabeled" and issue_path.is_file():
             review_text += ("\n" if review_text else "") + "Returned for review: " + issue_path.read_text(encoding="utf-8").strip()

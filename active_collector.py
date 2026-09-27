@@ -1,6 +1,9 @@
 """Collect useful YOLO gameplay frames for later human review. Edit settings below."""
 
 import os
+import shutil
+import subprocess
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -25,6 +28,7 @@ DEVICE_INDEX = 0
 OUTPUT_INDEX = 0  # Primary monitor on the selected graphics device.
 DEVICE = 0
 IMAGE_SIZE = 1024
+VIDEO_FPS = 20
 JPEG_QUALITY = 95
 INFERENCE_FPS = 1
 PREDICTION_CONFIDENCE = 0.15
@@ -37,6 +41,9 @@ HIGH_CONFIDENCE_SAMPLE_SECONDS = 120
 RECENT_HASH_COUNT = 50
 DUPLICATE_HASH_DISTANCE = 5  # 64-bit difference hash; lower values reject fewer frames.
 KEY_POLL_SECONDS = 0.05
+FFMPEG_EXECUTABLE = "ffmpeg"
+NVENC_PRESET = "p5"
+NVENC_QUALITY = 20
 
 START_KEY = 0xBB  # = / +
 STOP_KEY = 0xBD  # - / _
@@ -103,13 +110,103 @@ def save_candidate(output_dir: Path, frame, metadata: dict, number: int,
     return image_path, number + 1
 
 
+def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threading.Event,
+                 state: dict, state_lock: threading.Lock) -> None:
+    """Capture 20 FPS at DXcam's source resolution and publish 1024px review frames."""
+    log_path = video_path.with_suffix(".ffmpeg.log")
+    partial_path = video_path.with_name(f".{video_path.stem}.partial.mp4")
+    process = None
+    log_file = None
+    exit_code = None
+    camera_started = False
+    try:
+        camera.start(target_fps=VIDEO_FPS, video_mode=True)
+        camera_started = True
+        frame = camera.get_latest_frame(copy=True)
+        if frame is None:
+            raise RuntimeError("DXcam did not provide a frame")
+        source_height, source_width = frame.shape[:2]
+        command = [
+            ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{source_width}x{source_height}", "-framerate", str(VIDEO_FPS),
+            "-i", "pipe:0", "-an", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
+            "-rc", "vbr", "-cq", str(NVENC_QUALITY), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial_path),
+        ]
+        log_file = log_path.open("wb")
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log_file,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        frame_index = 0
+        next_frame_at = time.monotonic()
+        while not stop_event.is_set():
+            if process.poll() is not None:
+                raise RuntimeError(f"FFmpeg stopped unexpectedly. See {log_path}")
+            delay = next_frame_at - time.monotonic()
+            if delay > 0 and stop_event.wait(delay):
+                break
+            current = camera.get_latest_frame(copy=True)
+            if current is None:
+                continue
+            if current.shape[:2] != (source_height, source_width):
+                raise RuntimeError("Screen size changed during recording")
+            try:
+                process.stdin.write(current.tobytes())
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError(f"FFmpeg could not accept frames. See {log_path}") from exc
+            interpolation = cv2.INTER_AREA if max(current.shape[:2]) > IMAGE_SIZE else cv2.INTER_LINEAR
+            image_frame = cv2.resize(current, (IMAGE_SIZE, IMAGE_SIZE), interpolation=interpolation)
+            with state_lock:
+                state["frame"] = image_frame
+                state["frame_index"] = frame_index
+            frame_index += 1
+            next_frame_at += 1 / VIDEO_FPS
+            # If encoding or capture falls behind, skip elapsed ticks instead of speeding up later.
+            if next_frame_at < time.monotonic() - 1 / VIDEO_FPS:
+                next_frame_at = time.monotonic()
+    except Exception as exc:
+        state["error"] = str(exc)
+    finally:
+        if camera_started and camera.is_capturing:
+            camera.stop()
+        if process is not None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                exit_code = process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                exit_code = process.returncode
+        if log_file is not None:
+            log_file.close()
+        if process is not None and exit_code == 0:
+            try:
+                partial_path.replace(video_path)
+                state["video_saved"] = True
+                print(f"Saved {video_path} ({frame_index} frames at {VIDEO_FPS} FPS).")
+            except OSError as exc:
+                state["error"] = f"Could not finalize video: {exc}"
+        elif process is not None and exit_code != 0:
+            state["error"] = f"FFmpeg exited with code {exit_code}. See {log_path}"
+
+
 def main() -> None:
-    if INFERENCE_FPS <= 0 or MAX_SAVES_PER_SESSION <= 0 or MIN_SECONDS_BETWEEN_SAVES < 0:
+    if INFERENCE_FPS <= 0 or VIDEO_FPS <= 0 or MAX_SAVES_PER_SESSION <= 0 or MIN_SECONDS_BETWEEN_SAVES < 0:
         raise ValueError("FPS, save limit, and save interval settings are invalid")
     if not 0 <= PREDICTION_CONFIDENCE < REVIEW_CONFIDENCE_LOW < REVIEW_CONFIDENCE_HIGH <= 1:
         raise ValueError("Confidence settings must increase from prediction to review high")
     dataset_dir = Path(DATASET_DIR).expanduser().resolve()
     checkpoint = Path(CHECKPOINT_PATH).expanduser().resolve()
+    ffmpeg_path = shutil.which(FFMPEG_EXECUTABLE)
+    if ffmpeg_path is None:
+        raise FileNotFoundError(f"FFmpeg not found: {FFMPEG_EXECUTABLE}")
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     project = load_project(dataset_dir)
@@ -127,7 +224,7 @@ def main() -> None:
     checkpoint_stat = checkpoint.stat()
     checkpoint_identity = {"path": str(checkpoint), "size": checkpoint_stat.st_size,
                            "modified_ns": checkpoint_stat.st_mtime_ns}
-    session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
+    session_id = ""
     recent_hashes: deque[int] = deque(maxlen=RECENT_HASH_COUNT)
     last_saved_at = float("-inf")
     started_at = time.monotonic()
@@ -136,11 +233,16 @@ def main() -> None:
     saved_count = 0
     collecting = False
     next_due = started_at
+    recording_thread = None
+    recording_stop = None
+    recording_state = None
+    recording_lock = threading.Lock()
+    video_path = None
 
     camera = dxcam.create(device_idx=DEVICE_INDEX, output_idx=OUTPUT_INDEX, output_color="BGR")
     start_was_down = bool(win32api.GetAsyncKeyState(START_KEY) & 0x8000)
     stop_was_down = bool(win32api.GetAsyncKeyState(STOP_KEY) & 0x8000)
-    print(f"Ready: {project.root}. Press = to collect, - to pause, Ctrl+C to exit.")
+    print(f"Ready: {project.root}. Press = to collect and record, - to stop, Ctrl+C to exit.")
     print(f"First available image number: {next_number}. Limit: {MAX_SAVES_PER_SESSION} per run.")
     try:
         while True:
@@ -148,26 +250,56 @@ def main() -> None:
             stop_is_down = bool(win32api.GetAsyncKeyState(STOP_KEY) & 0x8000)
             if stop_is_down and not stop_was_down and collecting:
                 collecting = False
-                print(f"Paused. Saved {saved_count} candidate images.")
+                recording_stop.set()
+                recording_thread.join()
+                error = recording_state.get("error")
+                if error:
+                    print(f"Video recording error: {error}")
+                elif recording_state.get("video_saved"):
+                    print(f"Stopped. Saved {saved_count} candidate images and {video_path.name}.")
+                else:
+                    print(f"Stopped. Saved {saved_count} candidate images; no video was finalized.")
             elif start_is_down and not start_was_down and not collecting:
                 if saved_count < MAX_SAVES_PER_SESSION:
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    session_id = f"{timestamp}-{os.getpid()}"
+                    video_dir = dataset_dir / "videos"
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = video_dir / f"{session_id}.mp4"
+                    recording_stop = threading.Event()
+                    recording_state = {"frame": None, "frame_index": -1,
+                                       "video_saved": False, "error": None}
+                    recording_thread = threading.Thread(
+                        target=record_video,
+                        args=(camera, ffmpeg_path, video_path, recording_stop,
+                              recording_state, recording_lock),
+                        name="active-collector-video", daemon=True,
+                    )
+                    recording_thread.start()
                     collecting = True
                     next_due = time.monotonic()
-                    print(f"Collecting at {INFERENCE_FPS:g} FPS. Press - to pause.")
+                    print(f"Collecting images at {INFERENCE_FPS:g} FPS and recording {VIDEO_FPS} FPS. Press - to stop.")
                 else:
                     print("Session save limit reached. Restart the script for another session.")
             start_was_down, stop_was_down = start_is_down, stop_is_down
+
+            if collecting and recording_thread is not None and not recording_thread.is_alive():
+                collecting = False
+                print(f"Video recording stopped unexpectedly: {recording_state.get('error') or 'unknown error'}")
+                continue
 
             now = time.monotonic()
             if not collecting or now < next_due:
                 time.sleep(KEY_POLL_SECONDS)
                 continue
             next_due = now + 1 / INFERENCE_FPS
-            frame = camera.grab(new_frame_only=False)
-            if frame is None:
+            with recording_lock:
+                frame = recording_state.get("frame")
+                frame_index = recording_state.get("frame_index", -1)
+                if frame is not None:
+                    frame = frame.copy()
+            if frame is None or frame_index < 0:
                 continue
-            interpolation = cv2.INTER_AREA if max(frame.shape[:2]) > IMAGE_SIZE else cv2.INTER_LINEAR
-            frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE), interpolation=interpolation)
             result = model.predict(source=frame, conf=PREDICTION_CONFIDENCE,
                                    imgsz=IMAGE_SIZE, device=DEVICE, verbose=False)[0]
             draft_boxes = []
@@ -194,6 +326,11 @@ def main() -> None:
                 "checkpoint": checkpoint_identity,
                 "dhash": f"{frame_hash:016x}",
                 "boxes": draft_boxes,
+                "video": {
+                    "path": video_path.relative_to(dataset_dir).as_posix(),
+                    "frame_index": frame_index,
+                    "fps": VIDEO_FPS,
+                },
             }
             image_path, next_number = save_candidate(output_dir, frame, metadata, next_number, used_numbers)
             recent_hashes.append(frame_hash)
@@ -203,10 +340,19 @@ def main() -> None:
             print(f"Saved {image_path.name} ({reason}, {len(draft_boxes)} draft boxes; {saved_count}/{MAX_SAVES_PER_SESSION})")
             if saved_count >= MAX_SAVES_PER_SESSION:
                 collecting = False
-                print("Session save limit reached. Press Ctrl+C to exit.")
+                recording_stop.set()
+                recording_thread.join()
+                error = recording_state.get("error")
+                if error:
+                    print(f"Video recording error: {error}")
+                else:
+                    print("Session save limit reached and video saved. Press Ctrl+C to exit.")
     except KeyboardInterrupt:
         print(f"Stopped. Saved {saved_count} candidate images in {output_dir}.")
     finally:
+        if recording_thread is not None and recording_thread.is_alive():
+            recording_stop.set()
+            recording_thread.join()
         camera.release()
 
 
