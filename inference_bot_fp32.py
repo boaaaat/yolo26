@@ -24,6 +24,7 @@ WARMUP_PASSES = 2
 
 AUTO_SHOOT = True
 collect_data = False
+draw_boxes_overlay = False
 instant_mouse = False
 
 
@@ -41,6 +42,7 @@ def main() -> None:
     bot.WARMUP_PASSES = WARMUP_PASSES
     bot.AUTO_SHOOT = AUTO_SHOOT
     bot.collect_data = collect_data
+    bot.draw_boxes_overlay = draw_boxes_overlay
     bot.instant_mouse = instant_mouse
     bot.PRECISION = "fp32"
     bot.COMPILE_MODE = False

@@ -44,6 +44,7 @@ COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
 AUTO_SHOOT = True
 collect_data = True  # Reuse live detections; save useful frames on a background thread.
+draw_boxes_overlay = True  # Draw live boxes for every class over the primary display.
 COLLECT_MAX_DETECTIONS = 500
 instant_mouse = False  # Move to the aim point in one mouse event when enabled.
 SHOOT_INTERVAL_SECONDS = 0.10
@@ -373,8 +374,9 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int,
             imgsz=IMAGE_SIZE,
             rect=False,
             conf=min(CONFIDENCE, collection_confidence) if collection_confidence is not None else CONFIDENCE,
-            classes=None if collection_confidence is not None else [enemy_class_id],
-            max_det=COLLECT_MAX_DETECTIONS if collection_confidence is not None else 20,
+            classes=None if collection_confidence is not None or draw_boxes_overlay else [enemy_class_id],
+            max_det=(COLLECT_MAX_DETECTIONS if collection_confidence is not None
+                     else 100 if draw_boxes_overlay else 20),
             nms=PREDICT_NMS,
             compile=COMPILE_MODE,
             quantize=32,
@@ -417,6 +419,10 @@ def load_locked_center() -> tuple[int, int]:
 
 
 def main() -> None:
+    global collect_data
+    if draw_boxes_overlay and collect_data:
+        collect_data = False
+        print("Warning: draw_boxes_overlay is enabled; collect_data has been set to False.")
     if not (PRECISION in {"bf16", "fp32"} and INFERENCE_TARGET_FPS > 0 and MOUSE_UPDATE_HZ > 0 and
             0 < AIM_TIME_CONSTANT_SECONDS and MAX_MOUSE_STEP_PIXELS > 0 and
             0 <= AIM_HEIGHT_FROM_BOTTOM <= 1 and 0 < CONFIDENCE < 1 and
@@ -467,6 +473,7 @@ def main() -> None:
 
     camera = dxcam.create(device_idx=DXCAM_DEVICE_INDEX, output_idx=DXCAM_OUTPUT_INDEX,
                           output_color="BGR")
+    overlay = None
     try:
         full_frame = camera.grab(new_frame_only=False)
         if full_frame is None:
@@ -491,6 +498,13 @@ def main() -> None:
         print(f"Ready: {PRECISION.upper()} + {compile_description} model, "
               f"{IMAGE_SIZE}px input, {INFERENCE_TARGET_FPS} FPS target.")
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
+
+        if draw_boxes_overlay:
+            from inference_overlay import DetectionOverlay, OVERLAY_FPS
+
+            overlay = DetectionOverlay(screen_width, screen_height)
+            overlay.start()
+            print(f"Detection overlay enabled (up to {OVERLAY_FPS} redraws/second).")
 
         collector = None
         if collect_data:
@@ -519,7 +533,11 @@ def main() -> None:
                 while True:
                     if not hotkeys.is_alive() or not mouse.is_alive():
                         raise RuntimeError("A hotkey or mouse-control thread stopped unexpectedly")
+                    if overlay is not None and not overlay.is_alive():
+                        raise RuntimeError(f"Detection overlay stopped unexpectedly: {overlay.error}")
                     if not state.running.is_set():
+                        if overlay is not None:
+                            overlay.update(())
                         state.shutdown.wait(0.01)
                         next_frame = report_start = time.perf_counter_ns()
                         frames = 0
@@ -541,6 +559,19 @@ def main() -> None:
                             state.set_boxes(sampled_enemy_boxes(rows, enemy_ids[0]))
                             if state.running.is_set():
                                 collector.submit(frame, rows, time.perf_counter_ns())
+                        elif overlay is not None:
+                            rows = (result.boxes.data.detach().cpu().tolist()
+                                    if result.boxes is not None and len(result.boxes) else ())
+                            detections = []
+                            target_boxes = []
+                            for x1, y1, x2, y2, confidence, raw_class_id in rows:
+                                class_id = int(raw_class_id)
+                                detections.append((x1, y1, x2, y2, confidence, class_id,
+                                                   names.get(class_id, f"class {class_id}")))
+                                if class_id == enemy_ids[0]:
+                                    target_boxes.append((x1, y1, x2, y2))
+                            overlay.update(tuple(detections))
+                            state.set_boxes(tuple(target_boxes))
                         else:
                             state.set_boxes(enemy_boxes(result))
                         if REPORT_STAGE_TIMES:
@@ -570,6 +601,8 @@ def main() -> None:
                 if collector is not None:
                     collector.close()
     finally:
+        if overlay is not None:
+            overlay.close()
         camera.release()
 
 
