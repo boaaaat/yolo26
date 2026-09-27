@@ -23,6 +23,7 @@ REPORT_STAGE_TIMES = True  # Show capture, preprocessing, model, and postprocess
 WARMUP_PASSES = 2
 
 AUTO_SHOOT = True
+collect_data = False
 instant_mouse = False
 
 
@@ -39,6 +40,7 @@ def main() -> None:
     bot.REPORT_STAGE_TIMES = REPORT_STAGE_TIMES
     bot.WARMUP_PASSES = WARMUP_PASSES
     bot.AUTO_SHOOT = AUTO_SHOOT
+    bot.collect_data = collect_data
     bot.instant_mouse = instant_mouse
     bot.PRECISION = "fp32"
     bot.COMPILE_MODE = False

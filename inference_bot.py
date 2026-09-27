@@ -27,15 +27,15 @@ from ultralytics import YOLO
 from calibrate import CALIBRATION_PATH, calibration_instructions, make_dpi_aware
 
 
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26n" / "weights" / "best.pt"
 GPU_INDEX = 0
 DXCAM_DEVICE_INDEX = 0
 DXCAM_OUTPUT_INDEX = 0  # Primary display; coordinates below are primary-display coordinates.
 IMAGE_SIZE = 1024  # Fixed model input; smaller is faster but may miss small targets.
-INFERENCE_TARGET_FPS = 60
+INFERENCE_TARGET_FPS = 120
 CONFIDENCE = 0.50
 ENEMY_CLASS_NAME = "enemy"
-PREDICT_NMS = None  # None uses the checkpoint's default head; False selects YOLO26's NMS-free head.
+PREDICT_NMS = False  # None uses the checkpoint's default head; False selects YOLO26's NMS-free head.
 REPORT_STAGE_TIMES = False
 PRECISION = "bf16"  # The FP32 entry point overrides this for Pascal GPUs.
 COMPILE_MODE = "reduce-overhead"
@@ -43,6 +43,8 @@ WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
 AUTO_SHOOT = True
+collect_data = True  # Reuse live detections; save useful frames on a background thread.
+COLLECT_MAX_DETECTIONS = 500
 instant_mouse = False  # Move to the aim point in one mouse event when enabled.
 SHOOT_INTERVAL_SECONDS = 0.10
 SHOOT_HOLD_SECONDS = 0.09
@@ -360,7 +362,8 @@ def save_compiled_cache(path: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
+def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int,
+            collection_confidence: float | None = None):
     precision_context = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                          if PRECISION == "bf16" else nullcontext())
     with torch.inference_mode(), precision_context:
@@ -369,9 +372,9 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
             device=GPU_INDEX,
             imgsz=IMAGE_SIZE,
             rect=False,
-            conf=CONFIDENCE,
-            classes=[enemy_class_id],
-            max_det=20,
+            conf=min(CONFIDENCE, collection_confidence) if collection_confidence is not None else CONFIDENCE,
+            classes=None if collection_confidence is not None else [enemy_class_id],
+            max_det=COLLECT_MAX_DETECTIONS if collection_confidence is not None else 20,
             nms=PREDICT_NMS,
             compile=COMPILE_MODE,
             quantize=32,
@@ -379,11 +382,16 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
         )[0]
 
 
-def enemy_boxes(result) -> tuple[tuple[float, float, float, float], ...]:
+def enemy_boxes(result) -> tuple[BoxCoords, ...]:
     if result.boxes is None or len(result.boxes) == 0:
         return ()
     coordinates = result.boxes.xyxy.detach().cpu().tolist()
     return tuple((x1, y1, x2, y2) for x1, y1, x2, y2 in coordinates)
+
+
+def sampled_enemy_boxes(rows: tuple[tuple[float, ...], ...], enemy_class_id: int) -> tuple[BoxCoords, ...]:
+    return tuple((x1, y1, x2, y2) for x1, y1, x2, y2, confidence, class_id in rows
+                 if int(class_id) == enemy_class_id and confidence >= CONFIDENCE)
 
 
 def load_locked_center() -> tuple[int, int]:
@@ -415,7 +423,7 @@ def main() -> None:
             SHOOT_INTERVAL_SECONDS > SHOOT_HOLD_SECONDS > 0 and
             TARGET_LOST_FRAMES >= 1 and 0 <= TARGET_MATCH_MIN_IOU <= 1 and
             TARGET_MATCH_MAX_CENTER_DISTANCE > 0 and TARGET_MATCH_MAX_AREA_RATIO >= 1 and
-            IMAGE_SIZE > 0 and WARMUP_PASSES > 0):
+            IMAGE_SIZE > 0 and WARMUP_PASSES > 0 and COLLECT_MAX_DETECTIONS > 0):
         raise ValueError("FPS, aim, confidence, or shooting settings are invalid")
     make_dpi_aware()
     locked_center = load_locked_center()
@@ -484,6 +492,16 @@ def main() -> None:
               f"{IMAGE_SIZE}px input, {INFERENCE_TARGET_FPS} FPS target.")
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
 
+        collector = None
+        if collect_data:
+            try:
+                from inference_collection import BackgroundCollector
+
+                collector = BackgroundCollector(checkpoint, names)
+                collector.start()
+            except Exception as exc:
+                print(f"Data collection unavailable: {exc}")
+                collector = None
         print(f"Calibrated locked cursor: {locked_center}")
         state = AimState(locked_center)
         hotkeys = threading.Thread(target=watch_hotkeys, args=(state,), daemon=True)
@@ -514,8 +532,17 @@ def main() -> None:
                     if frame is not None:
                         if REPORT_STAGE_TIMES:
                             stage_ms["capture"] += (time.perf_counter_ns() - capture_start) / 1_000_000
-                        result = predict(model, frame, enemy_ids[0])
-                        state.set_boxes(enemy_boxes(result))
+                        sample_due = collector is not None and collector.due(time.perf_counter_ns())
+                        result = predict(model, frame, enemy_ids[0],
+                                         collector.prediction_confidence if sample_due else None)
+                        if sample_due:
+                            rows = (tuple(tuple(row) for row in result.boxes.data.detach().cpu().tolist())
+                                    if result.boxes is not None and len(result.boxes) else ())
+                            state.set_boxes(sampled_enemy_boxes(rows, enemy_ids[0]))
+                            if state.running.is_set():
+                                collector.submit(frame, rows, time.perf_counter_ns())
+                        else:
+                            state.set_boxes(enemy_boxes(result))
                         if REPORT_STAGE_TIMES:
                             for key in ("preprocess", "inference", "postprocess"):
                                 stage_ms[key] += result.speed[key]
@@ -540,6 +567,8 @@ def main() -> None:
                 state.shutdown.set()
                 hotkeys.join(timeout=1)
                 mouse.join(timeout=1)
+                if collector is not None:
+                    collector.close()
     finally:
         camera.release()
 
