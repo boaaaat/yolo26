@@ -9,7 +9,7 @@ import win32con
 import win32gui
 
 
-OVERLAY_FPS = 60
+UPDATE_MESSAGE = win32con.WM_APP + 1
 WDA_EXCLUDEFROMCAPTURE = 0x11
 
 Detection = tuple[float, float, float, float, float, int, str]
@@ -36,7 +36,7 @@ class DetectionOverlay:
         self.error: BaseException | None = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, name="detection-overlay", daemon=True)
-        self.dirty = False
+        self.redraw_pending = False
 
     def start(self) -> None:
         self.thread.start()
@@ -53,7 +53,11 @@ class DetectionOverlay:
             if self.detections == detections:
                 return
             self.detections = detections
-            self.dirty = True
+            if self.hwnd is None or self.redraw_pending:
+                return
+            self.redraw_pending = True
+            hwnd = self.hwnd
+        win32gui.PostMessage(hwnd, UPDATE_MESSAGE, 0, 0)
 
     def close(self) -> None:
         with self.lock:
@@ -84,16 +88,12 @@ class DetectionOverlay:
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
             user32.SetWindowDisplayAffinity.restype = ctypes.c_int
-            user32.SetTimer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p]
-            user32.SetTimer.restype = ctypes.c_size_t
             if not user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
                 print("Warning: Windows could not exclude the overlay from screen capture; "
                       "drawn boxes may appear in inference frames.")
             with self.lock:
                 self.hwnd = hwnd
             win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
-            if not user32.SetTimer(hwnd, 1, round(1000 / OVERLAY_FPS), None):
-                raise OSError(ctypes.get_last_error(), "Could not start overlay redraw timer")
             self.ready.set()
             win32gui.PumpMessages()
         except BaseException as exc:
@@ -104,12 +104,10 @@ class DetectionOverlay:
                 self.hwnd = None
 
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
-        if message == win32con.WM_TIMER:
+        if message == UPDATE_MESSAGE:
             with self.lock:
-                dirty = self.dirty
-                self.dirty = False
-            if dirty:
-                win32gui.InvalidateRect(hwnd, None, False)
+                self.redraw_pending = False
+            win32gui.InvalidateRect(hwnd, None, False)
             return 0
         if message == win32con.WM_PAINT:
             hdc, paint = win32gui.BeginPaint(hwnd)

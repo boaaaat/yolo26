@@ -420,9 +420,6 @@ def load_locked_center() -> tuple[int, int]:
 
 def main() -> None:
     global collect_data
-    if draw_boxes_overlay and collect_data:
-        collect_data = False
-        print("Warning: draw_boxes_overlay is enabled; collect_data has been set to False.")
     if not (PRECISION in {"bf16", "fp32"} and INFERENCE_TARGET_FPS > 0 and MOUSE_UPDATE_HZ > 0 and
             0 < AIM_TIME_CONSTANT_SECONDS and MAX_MOUSE_STEP_PIXELS > 0 and
             0 <= AIM_HEIGHT_FROM_BOTTOM <= 1 and 0 < CONFIDENCE < 1 and
@@ -500,11 +497,11 @@ def main() -> None:
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
 
         if draw_boxes_overlay:
-            from inference_overlay import DetectionOverlay, OVERLAY_FPS
+            from inference_overlay import DetectionOverlay
 
             overlay = DetectionOverlay(screen_width, screen_height)
             overlay.start()
-            print(f"Detection overlay enabled (up to {OVERLAY_FPS} redraws/second).")
+            print(f"Detection overlay enabled (follows inference at up to {INFERENCE_TARGET_FPS} FPS).")
 
         collector = None
         if collect_data:
