@@ -13,6 +13,8 @@ OVERLAY_FPS = 60
 WDA_EXCLUDEFROMCAPTURE = 0x11
 
 Detection = tuple[float, float, float, float, float, int, str]
+DrawDetection = tuple[int, int, int, int, int, int, str]
+MAX_DIRTY_BOXES = 48
 
 
 def class_color(class_id: int) -> int:
@@ -31,7 +33,10 @@ class DetectionOverlay:
         self.width = width
         self.height = height
         self.lock = threading.Lock()
-        self.detections: tuple[Detection, ...] = ()
+        self.detections: tuple[DrawDetection, ...] = ()
+        self.rendered_detections: tuple[DrawDetection, ...] = ()
+        self.pens: dict[int, int] = {}
+        self.colors: dict[int, int] = {}
         self.hwnd: int | None = None
         self.error: BaseException | None = None
         self.ready = threading.Event()
@@ -49,11 +54,39 @@ class DetectionOverlay:
         return self.thread.is_alive()
 
     def update(self, detections: tuple[Detection, ...]) -> None:
+        visible = tuple((round(left), round(top), round(right), round(bottom),
+                         round(confidence * 100), class_id, class_name)
+                        for left, top, right, bottom, confidence, class_id, class_name in detections)
         with self.lock:
-            if self.detections == detections:
+            if self.detections == visible:
                 return
-            self.detections = detections
+            self.detections = visible
             self.dirty = True
+
+    def _bounds(self, detection: DrawDetection) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2, confidence, _, class_name = detection
+        label_top = max(0, y1 - 18)
+        label_width = 12 * len(f"{class_name} {confidence}%")
+        return (max(0, min(x1, x2) - 3),
+                max(0, min(y1, y2, label_top) - 3),
+                min(self.width, max(x1, x2, x1 + 2 + label_width) + 3),
+                min(self.height, max(y1, y2, label_top + 18) + 3))
+
+    def _invalidate_changes(self, hwnd: int, current: tuple[DrawDetection, ...]) -> None:
+        changed = set(self.rendered_detections) ^ set(current)
+        self.rendered_detections = current
+        if not changed:
+            return
+        if len(changed) > MAX_DIRTY_BOXES:
+            win32gui.InvalidateRect(hwnd, None, False)
+            return
+        bounds = [self._bounds(detection) for detection in changed]
+        if sum((right - left) * (bottom - top) for left, top, right, bottom in bounds) > self.width * self.height // 2:
+            win32gui.InvalidateRect(hwnd, None, False)
+            return
+        for left, top, right, bottom in bounds:
+            if right > left and bottom > top:
+                win32gui.InvalidateRect(hwnd, (left, top, right, bottom), False)
 
     def close(self) -> None:
         with self.lock:
@@ -100,44 +133,44 @@ class DetectionOverlay:
             self.error = exc
             self.ready.set()
         finally:
+            for pen in self.pens.values():
+                win32gui.DeleteObject(pen)
             with self.lock:
                 self.hwnd = None
 
     def _window_proc(self, hwnd: int, message: int, wparam: int, lparam: int) -> int:
         if message == win32con.WM_TIMER:
             with self.lock:
-                dirty = self.dirty
+                if not self.dirty:
+                    return 0
+                current = self.detections
                 self.dirty = False
-            if dirty:
-                win32gui.InvalidateRect(hwnd, None, False)
+            self._invalidate_changes(hwnd, current)
             return 0
         if message == win32con.WM_PAINT:
             hdc, paint = win32gui.BeginPaint(hwnd)
             try:
                 win32gui.FillRect(hdc, (0, 0, self.width, self.height),
                                   win32gui.GetStockObject(win32con.BLACK_BRUSH))
-                with self.lock:
-                    detections = self.detections
-                pens = {}
                 old_pen = win32gui.SelectObject(hdc, win32gui.GetStockObject(win32con.NULL_PEN))
                 old_brush = win32gui.SelectObject(hdc, win32gui.GetStockObject(win32con.NULL_BRUSH))
                 try:
                     win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
-                    for left, top, right, bottom, confidence, class_id, class_name in detections:
-                        color = class_color(class_id)
-                        if class_id not in pens:
-                            pens[class_id] = win32gui.CreatePen(win32con.PS_SOLID, 2, color)
-                        win32gui.SelectObject(hdc, pens[class_id])
-                        win32gui.SetTextColor(hdc, color)
-                        x1, y1, x2, y2 = map(round, (left, top, right, bottom))
+                    for x1, y1, x2, y2, confidence, class_id, class_name in self.rendered_detections:
+                        pen = self.pens.get(class_id)
+                        if pen is None:
+                            color = class_color(class_id)
+                            pen = win32gui.CreatePen(win32con.PS_SOLID, 2, color)
+                            self.pens[class_id] = pen
+                            self.colors[class_id] = color
+                        win32gui.SelectObject(hdc, pen)
+                        win32gui.SetTextColor(hdc, self.colors[class_id])
                         win32gui.Rectangle(hdc, x1, y1, x2, y2)
-                        label = f"{class_name} {confidence:.0%}"
+                        label = f"{class_name} {confidence}%"
                         _text_out(hdc, x1 + 2, max(0, y1 - 18), label, len(label))
                 finally:
                     win32gui.SelectObject(hdc, old_pen)
                     win32gui.SelectObject(hdc, old_brush)
-                    for pen in pens.values():
-                        win32gui.DeleteObject(pen)
             finally:
                 win32gui.EndPaint(hwnd, paint)
             return 0
