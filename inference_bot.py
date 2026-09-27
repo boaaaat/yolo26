@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import dxcam
@@ -35,6 +35,7 @@ IMAGE_SIZE = 1024  # Fixed model input; smaller is faster but may miss small tar
 INFERENCE_TARGET_FPS = 60
 CONFIDENCE = 0.50
 ENEMY_CLASS_NAME = "enemy"
+PRECISION = "bf16"  # The FP32 entry point overrides this for Pascal GPUs.
 COMPILE_MODE = "reduce-overhead"
 WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
@@ -310,7 +311,7 @@ def compiled_cache_path(checkpoint: Path) -> Path:
         "checkpoint_sha256": checkpoint_hash,
         "image_size": IMAGE_SIZE,
         "compile_mode": COMPILE_MODE,
-        "dtype": "bfloat16",
+        "dtype": PRECISION,
         "torch": torch.__version__,
         "triton": triton_version,
         "ultralytics": importlib.metadata.version("ultralytics"),
@@ -358,7 +359,9 @@ def save_compiled_cache(path: Path) -> None:
 
 
 def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    precision_context = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                         if PRECISION == "bf16" else nullcontext())
+    with torch.inference_mode(), precision_context:
         return model.predict(
             source=frame,
             device=GPU_INDEX,
@@ -368,6 +371,7 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
             classes=[enemy_class_id],
             max_det=20,
             compile=COMPILE_MODE,
+            half=False,
             verbose=False,
         )[0]
 
@@ -402,7 +406,7 @@ def load_locked_center() -> tuple[int, int]:
 
 
 def main() -> None:
-    if not (INFERENCE_TARGET_FPS > 0 and MOUSE_UPDATE_HZ > 0 and
+    if not (PRECISION in {"bf16", "fp32"} and INFERENCE_TARGET_FPS > 0 and MOUSE_UPDATE_HZ > 0 and
             0 < AIM_TIME_CONSTANT_SECONDS and MAX_MOUSE_STEP_PIXELS > 0 and
             0 <= AIM_HEIGHT_FROM_BOTTOM <= 1 and 0 < CONFIDENCE < 1 and
             SHOOT_INTERVAL_SECONDS > SHOOT_HOLD_SECONDS > 0 and
@@ -416,17 +420,29 @@ def main() -> None:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for compiled BF16 inference")
+        raise RuntimeError("A CUDA-enabled PyTorch installation and NVIDIA GPU are required")
     torch.cuda.set_device(GPU_INDEX)
-    if not native_bf16_supported():
+    capability = torch.cuda.get_device_capability(GPU_INDEX)
+    supported_arches = torch.cuda.get_arch_list()
+    if capability[0] == 6 and supported_arches and not any(
+        arch.startswith("sm_") and arch[3:].isdigit()
+        and int(arch[3:]) // 10 == capability[0]
+        and int(arch[3:]) % 10 <= capability[1]
+        for arch in supported_arches
+    ):
+        raise RuntimeError(
+            f"This PyTorch CUDA build does not include Pascal support (GPU sm_{capability[0]}{capability[1]}). "
+            "Install a PyTorch CUDA 12.6 build in this environment; CUDA 13 builds omit Pascal."
+        )
+    if PRECISION == "bf16" and not native_bf16_supported():
         raise RuntimeError("This GPU or PyTorch build does not support native CUDA BF16")
-    if importlib.util.find_spec("triton") is None:
+    if COMPILE_MODE and importlib.util.find_spec("triton") is None:
         raise RuntimeError(
             'Native Windows torch.compile needs Triton. In the yolo environment, run '
             'python -m pip install "triton-windows>=3.8,<3.9" for PyTorch 2.14.'
         )
     torch.backends.cudnn.benchmark = True  # Fixed image shape lets cuDNN choose fast kernels.
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("high" if PRECISION == "bf16" else "highest")
 
     model = YOLO(str(checkpoint))
     if model.task != "detect":
@@ -435,8 +451,8 @@ def main() -> None:
     enemy_ids = [class_id for class_id, name in names.items() if name.casefold() == ENEMY_CLASS_NAME.casefold()]
     if len(enemy_ids) != 1:
         raise ValueError(f"Expected one {ENEMY_CLASS_NAME!r} class in checkpoint: {names}")
-    cache_path = compiled_cache_path(checkpoint)
-    cache_loaded = load_compiled_cache(cache_path)
+    cache_path = compiled_cache_path(checkpoint) if COMPILE_MODE else None
+    cache_loaded = load_compiled_cache(cache_path) if cache_path is not None else False
 
     camera = dxcam.create(device_idx=DXCAM_DEVICE_INDEX, output_idx=DXCAM_OUTPUT_INDEX,
                           output_color="BGR")
@@ -450,16 +466,19 @@ def main() -> None:
         if (screen_width, screen_height) != (primary_width, primary_height):
             raise ValueError("Selected DXcam output is not the primary display; adjust the output index")
         black_frame = np.zeros_like(full_frame)
-        action = "Using cached compiler artifacts and warming" if cache_loaded else "Compiling and warming"
+        action = ("Using cached compiler artifacts and warming" if cache_loaded else
+                  "Compiling and warming" if COMPILE_MODE else "Warming")
         print(f"{action} {checkpoint.name} on {torch.cuda.get_device_name(GPU_INDEX)}...")
         for _ in range(WARMUP_PASSES):
             predict(model, black_frame, enemy_ids[0])
         torch.cuda.synchronize(GPU_INDEX)
-        if getattr(model.predictor.model, "_orig_mod", None) is None:
+        if COMPILE_MODE and getattr(model.predictor.model, "_orig_mod", None) is None:
             raise RuntimeError("PyTorch compilation was unavailable; Ultralytics fell back to eager inference")
-        if not cache_loaded:
+        if cache_path is not None and not cache_loaded:
             save_compiled_cache(cache_path)
-        print(f"Ready: BF16 + compiled model, {IMAGE_SIZE}px input, {INFERENCE_TARGET_FPS} FPS target.")
+        compile_description = "compiled" if COMPILE_MODE else "eager"
+        print(f"Ready: {PRECISION.upper()} + {compile_description} model, "
+              f"{IMAGE_SIZE}px input, {INFERENCE_TARGET_FPS} FPS target.")
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {AUTO_SHOOT}; instant mouse: {instant_mouse}")
 
         print(f"Calibrated locked cursor: {locked_center}")
