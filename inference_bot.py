@@ -371,7 +371,7 @@ def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int):
             classes=[enemy_class_id],
             max_det=20,
             compile=COMPILE_MODE,
-            half=False,
+            quantize=32,
             verbose=False,
         )[0]
 
