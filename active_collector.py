@@ -19,7 +19,7 @@ from dataset_utils import (class_name_map, prediction_rows)
 
 # Settings
 DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26n" / "weights" / "best.pt"
 DEVICE_INDEX = 0
 OUTPUT_INDEX = 0  # Primary monitor on the selected graphics device.
 DEVICE = 0

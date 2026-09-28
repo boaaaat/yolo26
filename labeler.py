@@ -1028,6 +1028,7 @@ class LabelerWindow(QMainWindow):
         self.redo_history: list[list[Box]] = []
         self.suggestion_thread: QThread | None = None
         self.suggestion_worker: SuggestionWorker | None = None
+        self.discard_suggestion_result = False
         self.import_thread: QThread | None = None
         self.import_worker: ZipImportWorker | None = None
         self.import_progress: QProgressDialog | None = None
@@ -1203,6 +1204,11 @@ class LabelerWindow(QMainWindow):
         right_layout.addWidget(self._button("Accept selected  Enter", self.accept_selected))
         right_layout.addWidget(self._button("Accept all suggestions", self.accept_all))
         right_layout.addWidget(self._button("Reject all suggestions", self.reject_all))
+        negative_button = self._button("Mark negative", self.mark_negative)
+        negative_button.setToolTip(
+            "Clear all labels and suggestions, save an empty label file, and finish unlabeled images."
+        )
+        right_layout.addWidget(negative_button)
         right_layout.addSpacing(12)
         right_layout.addWidget(QLabel("SUGGESTION MODEL"))
         self.suggestion_source = RunSelector(self.refresh_suggestion_models)
@@ -2071,8 +2077,40 @@ class LabelerWindow(QMainWindow):
         self.record_change(before)
         self.statusBar().showMessage(f"Rejected {rejected} suggestions")
 
-    def suggest_boxes(self) -> None:
+    def mark_negative(self) -> None:
         if self.current_path is None:
+            return
+        image_path = self.current_path
+        # A prediction already running must not restore the boxes after this action.
+        if not self.suggest_button.isEnabled():
+            self.discard_suggestion_result = True
+        before = self.canvas.snapshot()
+        self.canvas.set_boxes([])
+        if before:
+            self.undo_history.append(before)
+            self.redo_history.clear()
+        self.refresh_box_list()
+        # Clear persisted drafts even when editing an image already in Labeled.
+        try:
+            metadata = load_review_metadata(image_path)
+            if metadata is not None:
+                metadata = {**metadata, "boxes": []}
+                save_review_metadata(image_path, metadata)
+                if self.review_data is not None:
+                    self.review_data = metadata
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Could not save negative image", str(exc))
+            return
+        if self.source_dir == self.dataset_dir / "unlabeled":
+            self.finish_current()
+            if self.current_path == image_path:
+                return
+        elif not self.save_current(force=True):
+            return
+        self.statusBar().showMessage(f"Marked {image_path.name} as negative · all labels and suggestions cleared")
+
+    def suggest_boxes(self) -> None:
+        if self.current_path is None or not self.suggest_button.isEnabled():
             return
         source = self.suggestion_source.currentData()
         if source is None:
@@ -2093,12 +2131,16 @@ class LabelerWindow(QMainWindow):
             self.suggestion_worker.failed.connect(self.on_suggestion_error)
             self.suggestion_thread.finished.connect(self.suggestion_worker.deleteLater)
             self.suggestion_thread.start()
+        self.discard_suggestion_result = False
         self.suggest_button.setEnabled(False)
         self.statusBar().showMessage(f"Running {self.suggestion_source.currentText()} predictions...")
         self.request_suggestions.emit(str(self.current_path), source)
 
     def on_suggestions(self, image_path: str, predictions: list[tuple]) -> None:
         self.suggest_button.setEnabled(True)
+        if self.discard_suggestion_result:
+            self.discard_suggestion_result = False
+            return
         if self.current_path is None or image_path != str(self.current_path):
             return
         width, height = self.canvas.image_width, self.canvas.image_height
@@ -2129,6 +2171,9 @@ class LabelerWindow(QMainWindow):
 
     def on_suggestion_error(self, image_path: str, message: str) -> None:
         self.suggest_button.setEnabled(True)
+        if self.discard_suggestion_result:
+            self.discard_suggestion_result = False
+            return
         if self.current_path is not None and image_path == str(self.current_path):
             QMessageBox.warning(self, "Suggestion failed", message)
         self.statusBar().showMessage("Model suggestion failed")
