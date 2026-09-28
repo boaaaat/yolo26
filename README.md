@@ -2,6 +2,36 @@
 
 Python tools for labeling object detection images, generating versioned YOLO datasets, and training a YOLO26 model. The labeler is a PySide6 desktop app. It starts with `datasets/rivals/unlabeled` and switches between the unlabeled and labeled folders of the selected dataset root.
 
+## Optimized inference on RTX 5070 / 5080
+
+`optimized_inference_bot.py` uses the medium checkpoint with a fixed rectangular FP16 TensorRT engine. It preserves the original 1024-pixel long-edge scale and full-screen coverage: a 3840x2160 or 2560x1440 display uses a 1024x576 input instead of adding padding to 1024x1024. Other aspect ratios receive only the padding needed for a stride of 32. No crosshair crop or automatic resolution reduction is used. Removing padding changes boundary context, and FP16 can change predictions; accuracy and the 120 FPS target have not been measured.
+
+Activate the existing CUDA 13 `yolo` environment and install the additional dependencies:
+
+```powershell
+conda activate yolo
+python -m pip install -r requirements-inference-blackwell.txt
+python optimized_inference_bot.py
+```
+
+The pinned TensorRT 10.16.1 CUDA 13 package includes the native builder/runtime libraries and Python bindings. A separate SDK ZIP or Python interpreter is unnecessary for this implementation. It does not install `trtexec`. The existing CUDA PyTorch and Ultralytics installation remains required; this implementation uses the `quantize` export API in Ultralytics 8.4.162. DXcam must support `grab(copy=False, new_frame_only=True)` (the installed DXcam does). Optional fused preprocessing uses the existing `triton-windows` installation, with a PyTorch CUDA fallback when unavailable.
+
+Settings are at the top of `optimized_inference_bot.py`. `draw_boxes_overlay` and `collect_data` default to `False`; enable either independently if wanted. The 120 FPS target applies with both off. Existing calibration is required for live operation (`python calibrate.py`). Press `=` to arm, `-` to pause, and Ctrl+C to exit. Target matching and mouse/shooting behavior reuse `inference_bot.py`; common control settings are exposed in the optimized entry point.
+
+The first launch exports/builds an engine in a separate process; this can take several minutes and use substantial GPU resources. Later launches reuse `.optimized_engine_cache/` when the checkpoint contents, shape, GPU, precision, and software versions match. Export intermediates stay in a temporary cache directory, leaving training checkpoints untouched. Each GPU builds its own engine. To build the engine without starting capture or controls:
+
+```powershell
+python optimized_inference_bot.py --build-only
+```
+
+Engine building necessarily traces the model and lets TensorRT time kernel choices; it does not run a detection validation suite or FPS benchmark. The live runtime warms its buffers and captures a CUDA graph before arming. Graph capture and fused preprocessing each have an explicit, logged fallback; TensorRT failures do not silently fall back to the old predictor. Remove the affected `.engine` and matching `.json` from `.optimized_engine_cache/` to force a rebuild.
+
+The capture worker owns DXcam and resizes into a three-slot pinned buffer pool. Only the newest pending frame is consumed; in-flight buffers cannot be overwritten. The direct runtime uses persistent device buffers, asynchronous copies, the NMS-free head with 300 candidates, and one completion wait per result. Capture/resize overlap GPU processing. Stale results expire after 100 ms, and results from before a pause cannot be applied after rearming. The original Python busy-spin wait is replaced in this entry point with sleeping waits.
+
+Every five seconds while armed, the bot reports fresh desktop-capture inference FPS, published-result FPS, capture rate, superseded captures, no-new-frame grabs, and stale results. Timings show capture, CPU resize, transfer plus GPU plus result completion, and capture-start-to-publication mean/p95. These are wall-clock pipeline measurements, not isolated GPU-kernel timings or display-presentation latency. Fresh desktop captures can include desktop/overlay changes; they are not a measurement of unique game-rendered frames. An unchanged screen may report very low FPS because cached frames are deliberately not inferred again.
+
+CPU capture/resize remains the initial capture backend. Native Direct3D/CUDA capture, TensorRT-RTX, INT8, and FP8 are later options if measurements justify them; they are not enabled here. No tests, smoke tests, engine builds, or FPS benchmarks were run as part of implementing this entry point.
+
 ## Setup
 
 Install Python 3.10 or newer and the packages needed for labeling and training:

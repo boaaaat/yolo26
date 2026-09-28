@@ -1,6 +1,7 @@
 # Local Python and editor state
 __pycache__/
 .inference_compile_cache/
+.optimized_engine_cache/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/

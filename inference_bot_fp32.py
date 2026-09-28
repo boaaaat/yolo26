@@ -10,7 +10,7 @@ from pathlib import Path
 import inference_bot as bot
 
 
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26n" / "weights" / "best.pt"
 GPU_INDEX = 0
 DXCAM_DEVICE_INDEX = 0
 DXCAM_OUTPUT_INDEX = 0

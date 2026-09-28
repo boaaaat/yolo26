@@ -3,11 +3,13 @@
 import base64
 import csv
 import html
+import json
 import math
 import os
+import statistics
 import tempfile
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -73,9 +75,9 @@ def _draw_panel(ax, history, title, series, *, fraction=False) -> None:
                 ha="center", va="center", color=MUTED, fontsize=11)
 
 
-def _render_chart(path: Path, run_name: str, history: dict[int, dict[str, float]]) -> None:
+def _render_chart(path: Path, run_name: str, history: dict[int, dict[str, float]]) -> dict:
     figure = Figure(figsize=(15, 8.6), dpi=140, facecolor=BACKGROUND)
-    FigureCanvasAgg(figure)
+    canvas = FigureCanvasAgg(figure)
     axes = figure.subplots(2, 3)
     figure.subplots_adjust(left=0.055, right=0.975, top=0.78, bottom=0.10,
                            wspace=0.27, hspace=0.42)
@@ -113,14 +115,106 @@ def _render_chart(path: Path, run_name: str, history: dict[int, dict[str, float]
                 color=COLORS[2], fontsize=23, fontweight="bold")
     figure.text(0.055, 0.035, "Higher is better for detection metrics; lower is better for losses.",
                 color=MUTED, fontsize=9)
+    canvas.draw()
+    width, height = canvas.get_width_height()
+    hover_points = []
+    for ax, (title, series, _fraction) in zip(axes.flat, panels):
+        for key, label in series:
+            for epoch, value in _metric(history, key):
+                x, y = ax.transData.transform((epoch, value))
+                if math.isfinite(x) and math.isfinite(y):
+                    hover_points.append({"panel": title, "series": label, "epoch": epoch,
+                                         "value": value, "x": round(x, 2), "y": round(height - y, 2)})
     figure.savefig(path, format="png", facecolor=BACKGROUND)
     figure.clear()
+    return {"width": width, "height": height, "points": hover_points}
+
+
+def _training_eta(history: dict[int, dict[str, float]], total_epochs: int | None) -> tuple[str, str, str]:
+    if not history or total_epochs is None or total_epochs <= 0:
+        return "—", "Waiting for completed epochs", "—"
+    latest_epoch = max(history)
+    if latest_epoch >= total_epochs:
+        return "Complete", f"{latest_epoch} / {total_epochs} epochs", "—"
+    timed = [(epoch, values["time"]) for epoch, values in sorted(history.items()) if "time" in values]
+    durations = [
+        (current_time - previous_time) / (current_epoch - previous_epoch)
+        for (previous_epoch, previous_time), (current_epoch, current_time) in zip(timed, timed[1:])
+        if current_epoch > previous_epoch and current_time > previous_time
+    ]
+    if durations:
+        recent = durations[-8:]
+        seconds_per_epoch = statistics.median(recent)
+        basis = f"Median of {len(recent)} recent epoch{'s' if len(recent) != 1 else ''}"
+    elif timed and timed[0][0] == 1 and timed[0][1] > 0:
+        seconds_per_epoch = timed[0][1]
+        basis = "Based on the first epoch"
+    else:
+        return "—", f"{latest_epoch} / {total_epochs} epochs · waiting for timing", "—"
+    remaining = (total_epochs - latest_epoch) * seconds_per_epoch
+    hours, remainder = divmod(round(remaining), 3600)
+    minutes = round(remainder / 60)
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    duration_text = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    finish_at = (datetime.now().astimezone() + timedelta(seconds=remaining)).strftime("%b %d, %I:%M %p %Z")
+    return duration_text, f"{latest_epoch} / {total_epochs} epochs · {basis}", finish_at
 
 
 def _write_html(path: Path, image_path: Path, csv_path: Path, run_name: str,
-                refresh_seconds: int, *, complete: bool = False) -> None:
+                refresh_seconds: int, chart: dict, history: dict[int, dict[str, float]],
+                total_epochs: int | None, *, complete: bool = False) -> None:
     encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    chart_json = json.dumps(chart, ensure_ascii=True, separators=(",", ":"))
     updated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    eta, eta_basis, finish_at = _training_eta(history, total_epochs)
+    if complete:
+        eta = "Finished"
+        eta_basis = f"{max(history) if history else 0} completed epochs"
+        finish_at = "—"
+    hover_script = """
+const chart = JSON.parse(document.getElementById('chart-data').textContent);
+const overlay = document.getElementById('chart-overlay');
+const marker = document.getElementById('chart-marker');
+const tooltip = document.getElementById('chart-tooltip');
+const wrapper = document.getElementById('chart-wrap');
+function hidePoint() {
+  marker.style.display = 'none';
+  tooltip.style.display = 'none';
+}
+overlay.addEventListener('mousemove', event => {
+  const rect = overlay.getBoundingClientRect();
+  const x = (event.clientX - rect.left) * chart.width / rect.width;
+  const y = (event.clientY - rect.top) * chart.height / rect.height;
+  let nearest = null;
+  let distance = Infinity;
+  for (const point of chart.points) {
+    const dx = (point.x - x) * rect.width / chart.width;
+    const dy = (point.y - y) * rect.height / chart.height;
+    const candidate = dx * dx + dy * dy;
+    if (candidate < distance) {
+      distance = candidate;
+      nearest = point;
+    }
+  }
+  if (!nearest || distance > 18 * 18) {
+    hidePoint();
+    return;
+  }
+  marker.setAttribute('cx', nearest.x);
+  marker.setAttribute('cy', nearest.y);
+  marker.style.display = '';
+  tooltip.textContent = `${nearest.panel} · ${nearest.series}\nEpoch ${nearest.epoch}: ${Number(nearest.value).toPrecision(5)}`;
+  tooltip.style.display = 'block';
+  const bounds = wrapper.getBoundingClientRect();
+  const wantedLeft = event.clientX - bounds.left + 14;
+  const wantedTop = event.clientY - bounds.top - tooltip.offsetHeight - 14;
+  tooltip.style.left = `${Math.max(8, Math.min(wantedLeft, wrapper.clientWidth - tooltip.offsetWidth - 8))}px`;
+  tooltip.style.top = `${wantedTop >= 8 ? wantedTop : event.clientY - bounds.top + 14}px`;
+});
+overlay.addEventListener('mouseleave', hidePoint);
+"""
     content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 {'' if complete else f'<meta http-equiv="refresh" content="{refresh_seconds}">'}
@@ -133,17 +227,30 @@ header {{ display: flex; justify-content: space-between; gap: 20px; align-items:
 h1 {{ margin: 0; font-size: 21px; }}
 .sub {{ color: {MUTED}; margin: 4px 0 0; }}
 .live {{ color: {COLORS[2]}; background: #143b34; border: 1px solid #286455; border-radius: 999px; padding: 7px 13px; }}
-.chart {{ display: block; width: 100%; margin: 22px 0; border: 1px solid #26354b; border-radius: 16px; box-shadow: 0 20px 60px #05091288; }}
+.stats {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 22px 0 0; }}
+.stat {{ min-width: 220px; padding: 14px 18px; border: 1px solid #26354b; border-radius: 12px; background: {PANEL}; }}
+.stat span, .stat small {{ display: block; color: {MUTED}; }}
+.stat strong {{ display: block; margin: 3px 0; font-size: 22px; }}
+.chart-wrap {{ position: relative; margin: 22px 0; }}
+.chart {{ display: block; width: 100%; height: auto; box-sizing: border-box; border: 1px solid #26354b; border-radius: 16px; box-shadow: 0 20px 60px #05091288; }}
+.chart-overlay {{ position: absolute; left: 1px; top: 1px; width: calc(100% - 2px); height: calc(100% - 2px); cursor: crosshair; }}
+.chart-tooltip {{ display: none; position: absolute; z-index: 2; padding: 9px 12px; border: 1px solid #5b7597; border-radius: 8px; background: #091422f2; color: {TEXT}; white-space: pre-line; pointer-events: none; box-shadow: 0 8px 24px #0008; }}
 a {{ color: {COLORS[0]}; text-decoration: none; margin-right: 18px; }} a:hover {{ text-decoration: underline; }}
 footer {{ color: {MUTED}; font-size: 13px; }}
 </style></head><body><main>
 <header><div><h1>{html.escape(run_name)} · Training dashboard</h1>
 <p class="sub">Updated {html.escape(updated)} · {'Training complete' if complete else f'Refreshes every {refresh_seconds} seconds'}</p></div>
 <span class="live">● {'COMPLETE' if complete else 'LIVE METRICS'}</span></header>
-<img class="chart" alt="Training metrics charts" src="data:image/png;base64,{encoded}">
+<div class="stats"><div class="stat"><span>Estimated time left</span><strong>{html.escape(eta)}</strong><small>{html.escape(eta_basis)}</small></div>
+<div class="stat"><span>Estimated finish</span><strong>{html.escape(finish_at)}</strong><small>Based on recent epoch times</small></div></div>
+<div class="chart-wrap" id="chart-wrap"><img class="chart" alt="Training metrics charts" src="data:image/png;base64,{encoded}">
+<svg class="chart-overlay" id="chart-overlay" viewBox="0 0 {chart['width']} {chart['height']}" preserveAspectRatio="none" aria-label="Hover over a chart point to see its value"><circle id="chart-marker" r="8" fill="none" stroke="#fff" stroke-width="3" style="display:none;pointer-events:none"/></svg>
+<div class="chart-tooltip" id="chart-tooltip" role="status"></div></div>
 <footer><a href="{html.escape(image_path.name)}" download>Download PNG</a>
 <a href="{html.escape(csv_path.name)}">Open results CSV</a>
 The chart reads the run's saved CSV, including epochs from an interrupted run.</footer>
+<script type="application/json" id="chart-data">{chart_json}</script>
+<script>{hover_script}</script>
 </main></body></html>"""
     descriptor, temporary = tempfile.mkstemp(prefix=".dashboard-", suffix=".html", dir=path.parent)
     try:
@@ -197,12 +304,20 @@ class TrainingDashboard:
             self.history.update(_read_history(self.csv_path))
             temporary_image = self.image_path.with_name(".training_dashboard.tmp.png")
             try:
-                _render_chart(temporary_image, Path(trainer.save_dir).name, self.history)
+                chart = _render_chart(temporary_image, Path(trainer.save_dir).name, self.history)
                 os.replace(temporary_image, self.image_path)
             finally:
                 temporary_image.unlink(missing_ok=True)
+            planned_epochs = getattr(trainer, "epochs", None)
+            if planned_epochs is None:
+                planned_epochs = getattr(getattr(trainer, "args", None), "epochs", None)
+            try:
+                planned_epochs = int(planned_epochs) if planned_epochs is not None else None
+            except (TypeError, ValueError):
+                planned_epochs = None
             _write_html(self.html_path, self.image_path, self.csv_path,
-                        Path(trainer.save_dir).name, self.refresh_seconds, complete=complete)
+                        Path(trainer.save_dir).name, self.refresh_seconds, chart,
+                        self.history, planned_epochs, complete=complete)
             self.last_csv_state = csv_state
         except Exception as exc:
             self.disabled = True

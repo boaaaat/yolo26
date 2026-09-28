@@ -1,0 +1,11 @@
+# Additional packages for the existing CUDA 13 / Python 3.12 yolo environment.
+# TensorRT includes its native builder/runtime DLLs and Python bindings.
+tensorrt-cu13==10.16.1.11
+onnx==1.19.1
+onnxslim==0.1.96
+onnxruntime==1.30.0
+protobuf==5.29.6
+ultralytics==8.4.162
+dxcam==0.3.0
+# Existing project dependencies: CUDA PyTorch, numpy, opencv-python, pywin32,
+# filelock. Optional fused preprocessing uses triton-windows matched to PyTorch.

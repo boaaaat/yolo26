@@ -27,7 +27,7 @@ from ultralytics import YOLO
 from calibrate import CALIBRATION_PATH, calibration_instructions, make_dpi_aware
 
 
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26n" / "weights" / "best.pt"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26m" / "weights" / "best.pt"
 GPU_INDEX = 0
 DXCAM_DEVICE_INDEX = 0
 DXCAM_OUTPUT_INDEX = 0  # Primary display; coordinates below are primary-display coordinates.
