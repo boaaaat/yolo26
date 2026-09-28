@@ -15,10 +15,10 @@ from dataset_project import (
 )
 from dataset_zip_import import ImportResult, import_dataset_zip
 from review_metadata import load_review_metadata, metadata_path, save_review_metadata
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSizeF, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
     QInputDialog,
@@ -880,13 +881,22 @@ class VideoDialog(QDialog):
         self.setWindowTitle(f"Video · {video_path.name}")
         self.resize(1000, 760)
         self.setMinimumSize(640, 480)
+        self.setWindowFlag(Qt.WindowType.WindowTitleHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowSystemMenuHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         self._seeking = False
         self._initial_seek_ms = round(frame_index * 1000 / fps)
         self._initial_seek_done = False
+        self._pause_after_first_frame = False
 
         layout = QVBoxLayout(self)
-        self.video_widget = QVideoWidget(self)
-        layout.addWidget(self.video_widget, 1)
+        self.video_scene = QGraphicsScene(self)
+        self.video_item = QGraphicsVideoItem()
+        self.video_scene.addItem(self.video_item)
+        self.video_view = VideoGraphicsView(self.video_scene, self)
+        layout.addWidget(self.video_view, 1)
 
         controls = QHBoxLayout()
         self.play_button = QPushButton("Play")
@@ -899,13 +909,18 @@ class VideoDialog(QDialog):
         controls.addWidget(self.position_slider, 1)
         self.time_label = QLabel("0:00 / 0:00")
         controls.addWidget(self.time_label)
+        reset_zoom = QPushButton("Reset zoom")
+        reset_zoom.clicked.connect(self.reset_video_zoom)
+        controls.addWidget(reset_zoom)
         exit_button = QPushButton("Exit video  X")
         exit_button.clicked.connect(self.accept)
         controls.addWidget(exit_button)
         layout.addLayout(controls)
 
         self.player = QMediaPlayer(self)
-        self.player.setVideoOutput(self.video_widget)
+        self.player.setVideoOutput(self.video_item)
+        self.video_item.nativeSizeChanged.connect(self.on_video_size_changed)
+        self.player.videoSink().videoFrameChanged.connect(self.on_video_frame)
         self.player.positionChanged.connect(self.on_position_changed)
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
@@ -948,6 +963,21 @@ class VideoDialog(QDialog):
         }):
             self._initial_seek_done = True
             self.player.setPosition(min(self._initial_seek_ms, self.player.duration()))
+            self._pause_after_first_frame = True
+            self.player.play()
+
+    def on_video_frame(self, _frame) -> None:
+        if self._pause_after_first_frame:
+            self._pause_after_first_frame = False
+            self.player.pause()
+
+    def on_video_size_changed(self, size: QSizeF) -> None:
+        self.video_item.setSize(size)
+        self.video_scene.setSceneRect(QRectF(0, 0, size.width(), size.height()))
+        self.video_view.fit_video()
+
+    def reset_video_zoom(self) -> None:
+        self.video_view.fit_video()
 
     def on_playback_state_changed(self, state) -> None:
         self.play_button.setText("Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
@@ -965,6 +995,32 @@ class VideoDialog(QDialog):
     def done(self, result: int) -> None:
         self.player.stop()
         super().done(result)
+
+
+class VideoGraphicsView(QGraphicsView):
+    def __init__(self, scene: QGraphicsScene, parent=None) -> None:
+        super().__init__(scene, parent)
+        self._zoom = 1.0
+        self.setBackgroundBrush(QBrush(QColor("#000000")))
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def fit_video(self) -> None:
+        if not self.scene().sceneRect().isEmpty():
+            self.resetTransform()
+            self.fitInView(self.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self._zoom = 1.0
+
+    def wheelEvent(self, event) -> None:
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        if not 1.0 <= self._zoom * factor <= 8.0:
+            event.ignore()
+            return
+        self.scale(factor, factor)
+        self._zoom *= factor
+        event.accept()
 
 
 class LabelerWindow(QMainWindow):
