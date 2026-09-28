@@ -47,6 +47,7 @@ NVENC_QUALITY = 20
 
 START_KEY = 0xBB  # = / +
 STOP_KEY = 0xBD  # - / _
+SAVE_KEY = 0x56  # V: save the current video frame for review.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
@@ -232,6 +233,7 @@ def main() -> None:
                          "uncertain": float("-inf")}
     saved_count = 0
     collecting = False
+    manual_save_pending = False
     next_due = started_at
     recording_thread = None
     recording_stop = None
@@ -242,14 +244,19 @@ def main() -> None:
     camera = dxcam.create(device_idx=DEVICE_INDEX, output_idx=OUTPUT_INDEX, output_color="BGR")
     start_was_down = bool(win32api.GetAsyncKeyState(START_KEY) & 0x8000)
     stop_was_down = bool(win32api.GetAsyncKeyState(STOP_KEY) & 0x8000)
-    print(f"Ready: {project.root}. Press = to collect and record, - to stop, Ctrl+C to exit.")
+    save_was_down = bool(win32api.GetAsyncKeyState(SAVE_KEY) & 0x8000)
+    print(f"Ready: {project.root}. Press = to collect and record, V to save a frame, - to stop, Ctrl+C to exit.")
     print(f"First available image number: {next_number}. Limit: {MAX_SAVES_PER_SESSION} per run.")
     try:
         while True:
             start_is_down = bool(win32api.GetAsyncKeyState(START_KEY) & 0x8000)
             stop_is_down = bool(win32api.GetAsyncKeyState(STOP_KEY) & 0x8000)
+            save_key_state = win32api.GetAsyncKeyState(SAVE_KEY)
+            save_is_down = bool(save_key_state & 0x8000)
+            save_pressed = bool(save_key_state & 0x0001) or (save_is_down and not save_was_down)
             if stop_is_down and not stop_was_down and collecting:
                 collecting = False
+                manual_save_pending = False
                 recording_stop.set()
                 recording_thread.join()
                 error = recording_state.get("error")
@@ -278,28 +285,35 @@ def main() -> None:
                     recording_thread.start()
                     collecting = True
                     next_due = time.monotonic()
-                    print(f"Collecting images at {INFERENCE_FPS:g} FPS and recording {VIDEO_FPS} FPS. Press - to stop.")
+                    print(f"Collecting images at {INFERENCE_FPS:g} FPS and recording {VIDEO_FPS} FPS. Press V to save or - to stop.")
                 else:
                     print("Session save limit reached. Restart the script for another session.")
             start_was_down, stop_was_down = start_is_down, stop_is_down
+            save_was_down = save_is_down
+            if save_pressed and collecting:
+                manual_save_pending = True
 
             if collecting and recording_thread is not None and not recording_thread.is_alive():
                 collecting = False
+                manual_save_pending = False
                 print(f"Video recording stopped unexpectedly: {recording_state.get('error') or 'unknown error'}")
                 continue
 
             now = time.monotonic()
-            if not collecting or now < next_due:
+            if not collecting or (now < next_due and not manual_save_pending):
                 time.sleep(KEY_POLL_SECONDS)
                 continue
-            next_due = now + 1 / INFERENCE_FPS
             with recording_lock:
                 frame = recording_state.get("frame")
                 frame_index = recording_state.get("frame_index", -1)
                 if frame is not None:
                     frame = frame.copy()
             if frame is None or frame_index < 0:
+                time.sleep(KEY_POLL_SECONDS)
                 continue
+            manual_save = manual_save_pending
+            manual_save_pending = False
+            next_due = now + 1 / INFERENCE_FPS
             result = model.predict(source=frame, conf=PREDICTION_CONFIDENCE,
                                    imgsz=IMAGE_SIZE, device=DEVICE, verbose=False)[0]
             draft_boxes = []
@@ -311,12 +325,13 @@ def main() -> None:
                         "confidence": float(predicted.conf.item()),
                         "xywhn": [float(value) for value in predicted.xywhn[0].tolist()],
                     })
-            reason = choose_reason([box["confidence"] for box in draft_boxes], now, last_reason_saved)
-            if reason is None or now - last_saved_at < MIN_SECONDS_BETWEEN_SAVES:
+            reason = ("manual" if manual_save else
+                      choose_reason([box["confidence"] for box in draft_boxes], now, last_reason_saved))
+            if not manual_save and (reason is None or now - last_saved_at < MIN_SECONDS_BETWEEN_SAVES):
                 continue
             frame_hash = difference_hash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            if any(hash_distance(frame_hash, previous) <= DUPLICATE_HASH_DISTANCE
-                   for previous in recent_hashes):
+            if not manual_save and any(hash_distance(frame_hash, previous) <= DUPLICATE_HASH_DISTANCE
+                                       for previous in recent_hashes):
                 continue
             metadata = {
                 "schema_version": 1,
@@ -335,7 +350,8 @@ def main() -> None:
             image_path, next_number = save_candidate(output_dir, frame, metadata, next_number, used_numbers)
             recent_hashes.append(frame_hash)
             last_saved_at = now
-            last_reason_saved[reason] = now
+            if not manual_save:
+                last_reason_saved[reason] = now
             saved_count += 1
             print(f"Saved {image_path.name} ({reason}, {len(draft_boxes)} draft boxes; {saved_count}/{MAX_SAVES_PER_SESSION})")
             if saved_count >= MAX_SAVES_PER_SESSION:

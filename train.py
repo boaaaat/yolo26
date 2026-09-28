@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # Use the latest generated version in the most recently opened dataset.
 # Set a specific version path here to train that version instead.
 DATASET_PATH = None
-MODEL = "yolo26l.pt"  # Pretrained medium model used for a new run.
+MODEL = "yolo26m.pt"  # Pretrained medium model used for a new run.
 
 # EPOCHS = 250  # Total for "new"; additional epochs for "continue".
 EPOCHS = 200
@@ -21,7 +21,7 @@ BATCH_SIZE = 4
 DEVICE = 0  # First NVIDIA GPU; use "cpu" to train without CUDA.
 WORKERS = 4
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
-RUN_NAME = "yolo26l"
+RUN_NAME = "yolo26m"
 TRAIN_MODE = "new"  # "new", "resume" an interrupted run, or "continue" a completed run.
 
 # CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "last.pt"
