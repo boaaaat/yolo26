@@ -1,6 +1,7 @@
 """Press = to start screen recording and - to stop. Press Ctrl+C to exit."""
 
 import shutil
+import queue
 import subprocess
 import threading
 import time
@@ -48,10 +49,15 @@ def watch_hotkeys(
 
 
 def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threading.Event,
-                 *, fps: int, preset: str, quality: int, on_frame=None, paced=False) -> int:
-    """Encode native-resolution frames; optionally publish each encoded frame for review."""
+                 *, fps: int, preset: str, quality: int, on_frame=None, paced=False,
+                 preview_fps: int | None = None, on_preview=None) -> int:
+    """Encode frames, with optional faster previews and an indexed encoded-frame callback."""
     if not isinstance(fps, int) or fps <= 0:
         raise ValueError("FPS must be a positive integer")
+    if preview_fps is not None and (not isinstance(preview_fps, int) or preview_fps <= 0):
+        raise ValueError("Preview FPS must be a positive integer")
+    capture_fps = max(fps, preview_fps or fps)
+    paced = paced or preview_fps is not None
     if video_path.exists():
         raise FileExistsError(video_path)
     log_path = video_path.with_suffix(".ffmpeg.log")
@@ -60,8 +66,36 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
     exit_code = None
     camera_started = False
     frame_count = 0
+    dropped_video_frames = 0
+    encoder_thread = None
+    encoder_stop = threading.Event()
+    encoder_queue = queue.Queue(maxsize=2)
+    encoder_errors = []
+
+    def encode_frame(frame):
+        nonlocal frame_count
+        try:
+            payload = memoryview(frame).cast("B") if frame.flags.c_contiguous else frame.tobytes()
+            process.stdin.write(payload)
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(f"FFmpeg could not accept frames. See {log_path}") from exc
+        if on_frame is not None:
+            on_frame(frame, frame_count)
+        frame_count += 1
+
+    def encode_pending():
+        try:
+            while not encoder_stop.is_set() or not encoder_queue.empty():
+                try:
+                    pending = encoder_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                encode_frame(pending)
+        except Exception as exc:
+            encoder_errors.append(exc)
+
     try:
-        camera.start(target_fps=fps, video_mode=True)
+        camera.start(target_fps=capture_fps, video_mode=True)
         camera_started = True
         frame = camera.get_latest_frame(copy=True)
         if frame is None:
@@ -79,30 +113,45 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
         log_file = log_path.open("wb")
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                    stderr=log_file, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        next_frame_at = time.monotonic()
+        if preview_fps is not None:
+            encoder_thread = threading.Thread(target=encode_pending, name="video-encoder", daemon=True)
+            encoder_thread.start()
+        next_frame_at = time.perf_counter()
+        next_video_at = next_frame_at
         while not stop_event.is_set():
+            if encoder_errors:
+                raise RuntimeError("Video encoder failed") from encoder_errors[0]
             if process.poll() is not None:
                 raise RuntimeError(f"FFmpeg stopped unexpectedly. See {log_path}")
             if paced:
-                delay = next_frame_at - time.monotonic()
-                if delay > 0 and stop_event.wait(delay):
+                delay = next_frame_at - time.perf_counter()
+                # DXcam already paces fresh preview frames. A second sleep can
+                # miss a capture and turn a 60 Hz preview into a 30 Hz preview.
+                if preview_fps is None and delay > 0 and stop_event.wait(delay):
                     break
                 frame = camera.get_latest_frame(copy=True)
                 if frame is None:
                     continue
             if frame.shape[:2] != (height, width):
                 raise RuntimeError("Screen size changed during recording")
-            try:
-                process.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError) as exc:
-                raise RuntimeError(f"FFmpeg could not accept frames. See {log_path}") from exc
-            if on_frame is not None:
-                on_frame(frame, frame_count)
-            frame_count += 1
+            if on_preview is not None:
+                on_preview(frame)
+            if preview_fps is None or time.perf_counter() >= next_video_at:
+                if encoder_thread is None:
+                    encode_frame(frame)
+                else:
+                    try:
+                        encoder_queue.put_nowait(frame)
+                    except queue.Full:
+                        # Never let a stalled encoder block fresh preview frames.
+                        dropped_video_frames += 1
+                next_video_at += 1 / fps
+                if next_video_at < time.perf_counter() - 1 / fps:
+                    next_video_at = time.perf_counter()
             if paced:
-                next_frame_at += 1 / fps
-                if next_frame_at < time.monotonic() - 1 / fps:
-                    next_frame_at = time.monotonic()
+                next_frame_at += 1 / capture_fps
+                if next_frame_at < time.perf_counter() - 1 / capture_fps:
+                    next_frame_at = time.perf_counter()
             else:
                 next_frame = camera.get_latest_frame(copy=True)
                 if next_frame is not None:
@@ -112,6 +161,12 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
             if camera_started and camera.is_capturing:
                 camera.stop()
         finally:
+            if encoder_thread is not None:
+                encoder_stop.set()
+                encoder_thread.join(timeout=10)
+                if encoder_thread.is_alive():
+                    process.kill()
+                    encoder_thread.join(timeout=2)
             if process is not None:
                 if process.stdin is not None:
                     try:
@@ -132,6 +187,10 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
                 print(f"Saved {video_path} ({frame_count} frames at {fps} FPS).")
     if exit_code != 0:
         raise RuntimeError(f"FFmpeg exited with code {exit_code}. See {log_path}")
+    if encoder_errors:
+        raise RuntimeError("Video encoder failed") from encoder_errors[0]
+    if dropped_video_frames:
+        print(f"Warning: video encoding fell behind; dropped {dropped_video_frames} video frames.")
     return frame_count
 
 

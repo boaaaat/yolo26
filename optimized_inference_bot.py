@@ -242,9 +242,7 @@ def run_loop(runner, capture, state, geometry, names, enemy_id, overlay, collect
                     last_capture_ns = slot.capture_started_ns
                     if overlay is not None and completed_ns >= next_overlay:
                         overlay_rows = rows[rows[:, 4] >= CONFIDENCE][:MAX_DISPLAY_DETECTIONS]
-                        overlay.update(tuple((float(x1), float(y1), float(x2), float(y2), float(score),
-                                              int(cls), names.get(int(cls), f"class {int(cls)}"))
-                                             for x1, y1, x2, y2, score, cls in overlay_rows))
+                        overlay.update_rows(overlay_rows, names)
                         next_overlay = completed_ns + round(1_000_000_000 / 60)
                     if sample_due:
                         collector.submit(slot.original, tuple(tuple(float(v) for v in row)

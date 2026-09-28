@@ -332,25 +332,15 @@ def main(options=None) -> None:
                         sample_due = collector is not None and collector.due(time.perf_counter_ns())
                         result = predict(model, frame, enemy_ids[0],
                                          collector.prediction_confidence if sample_due else None, options=options)
-                        if sample_due:
+                        if sample_due or overlay is not None:
                             rows = (tuple(tuple(row) for row in result.boxes.data.detach().cpu().tolist())
                                     if result.boxes is not None and len(result.boxes) else ())
                             state.set_boxes(sampled_enemy_boxes(rows, enemy_ids[0], options=options))
-                            if state.running.is_set():
+                            if sample_due and state.running.is_set():
                                 collector.submit(frame, rows, time.perf_counter_ns())
-                        elif overlay is not None:
-                            rows = (result.boxes.data.detach().cpu().tolist()
-                                    if result.boxes is not None and len(result.boxes) else ())
-                            detections = []
-                            target_boxes = []
-                            for x1, y1, x2, y2, confidence, raw_class_id in rows:
-                                class_id = int(raw_class_id)
-                                detections.append((x1, y1, x2, y2, confidence, class_id,
-                                                   names.get(class_id, f"class {class_id}")))
-                                if class_id == enemy_ids[0]:
-                                    target_boxes.append((x1, y1, x2, y2))
-                            overlay.update(tuple(detections))
-                            state.set_boxes(tuple(target_boxes))
+                            if overlay is not None:
+                                overlay.update_rows(rows if state.running.is_set() else (), names,
+                                                    confidence=options.CONFIDENCE)
                         else:
                             state.set_boxes(enemy_boxes(result))
                         if options.REPORT_STAGE_TIMES:
