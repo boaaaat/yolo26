@@ -1,6 +1,7 @@
 """Collect useful YOLO gameplay frames for later human review. Edit settings below."""
 
-from inference_collection import CollectionOptions, SampleWriter
+from inference_collection import CollectionOptions, BackgroundCollector
+from collections import OrderedDict, deque
 from recorder import record_video as write_video
 import os
 import shutil
@@ -41,6 +42,7 @@ OVERLAY_CONFIDENCE = 0.50
 OVERLAY_MAX_AGE_SECONDS = 0.25
 OPENCV_THREADS = 2
 TORCH_CPU_THREADS = 1
+REPORT_INTERVAL_SECONDS = 5.0
 PREDICTION_CONFIDENCE = 0.15
 REVIEW_CONFIDENCE_LOW = 0.50
 REVIEW_CONFIDENCE_HIGH = 0.80
@@ -81,6 +83,7 @@ def collection_options() -> CollectionOptions:
 def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threading.Event,
                  state: dict, state_lock: threading.Condition) -> None:
     """Publish review frames while the shared recorder owns video encoding."""
+    preview_frames = OrderedDict()
     def resize_frame(frame):
         interpolation = cv2.INTER_AREA if max(frame.shape[:2]) > IMAGE_SIZE else cv2.INTER_LINEAR
         return cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE), interpolation=interpolation)
@@ -89,18 +92,25 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
         preview_time = time.perf_counter()
         preview_frame = resize_frame(frame)
         with state_lock:
+            preview_frames[id(frame)] = (preview_frame, preview_time)
+            preview_frames.move_to_end(id(frame))
+            while len(preview_frames) > 8:
+                preview_frames.popitem(last=False)
             state["preview_frame"] = preview_frame
             state["preview_time"] = preview_time
+            state["preview_count"] = state.get("preview_count", 0) + 1
             state_lock.notify_all()
 
     def publish(frame, frame_index):
         # Encoding runs separately: use this exact encoded frame, never the
         # newer preview frame, so review images retain correct video indices.
-        image_frame = resize_frame(frame)
+        with state_lock:
+            cached = preview_frames.pop(id(frame), None)
+        image_frame, frame_time = cached if cached is not None else (resize_frame(frame), time.perf_counter())
         with state_lock:
             state["frame"] = image_frame
             state["frame_index"] = frame_index
-            state["frame_time"] = time.perf_counter()
+            state["frame_time"] = frame_time
             state_lock.notify_all()
     try:
         write_video(camera, ffmpeg_path, video_path, stop_event, fps=VIDEO_FPS,
@@ -151,14 +161,17 @@ def main() -> None:
     # Compile before recording starts so compilation never stalls a live session.
     runtime.warmup(confidence=PREDICTION_CONFIDENCE, max_detections=MAX_DETECTIONS)
 
-    writer = SampleWriter(checkpoint, model_names, collection_options())
+    writer = BackgroundCollector(checkpoint, model_names, collection_options())
     output_dir = writer.output_dir
     started_at = time.perf_counter()
     collecting = False
     manual_save_pending = False
     next_due = started_at
-    next_preview_due = started_at
     last_preview_time = None
+    prediction_cache = deque(maxlen=8)
+    report_started = started_at
+    report_capture_count = report_paint_count = preview_results = model_calls = 0
+    inference_times = deque(maxlen=2048)
     recording_thread = None
     recording_stop = None
     recording_state = None
@@ -174,6 +187,7 @@ def main() -> None:
     print(f"Ready: {project.root}. Press = to collect and record, V to save a frame, - to stop, Ctrl+C to exit.")
     print(f"First available image number: {writer.next_number}. Limit: {MAX_SAVES_PER_SESSION} per run.")
     try:
+        writer.start()
         if draw_boxes_overlay:
             width, height = camera.width, camera.height
             if (width, height) != (win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
@@ -183,6 +197,8 @@ def main() -> None:
             overlay.start()
             print(f"Live overlay: {OVERLAY_FPS} FPS target, confidence >= {OVERLAY_CONFIDENCE:g}.")
         while True:
+            if writer.stopping.is_set():
+                raise RuntimeError("The background sample writer stopped; see the collection error above")
             if overlay is not None and not overlay.is_alive():
                 raise RuntimeError(f"Detection overlay stopped unexpectedly: {overlay.error}")
             start_is_down = bool(win32api.GetAsyncKeyState(START_KEY) & 0x8000)
@@ -223,8 +239,12 @@ def main() -> None:
                     recording_thread.start()
                     collecting = True
                     next_due = time.perf_counter()
-                    next_preview_due = next_due
                     last_preview_time = None
+                    prediction_cache.clear()
+                    report_started = next_due
+                    report_capture_count = preview_results = model_calls = 0
+                    report_paint_count = overlay.paint_count if overlay is not None else 0
+                    inference_times.clear()
                     print(f"Collecting images at {INFERENCE_FPS:g} FPS and recording {VIDEO_FPS} FPS. Press V to save or - to stop.")
                 else:
                     print("Session save limit reached. Restart the script for another session.")
@@ -245,11 +265,28 @@ def main() -> None:
             if not collecting:
                 time.sleep(KEY_POLL_SECONDS)
                 continue
-            sample_due = now >= next_due or manual_save_pending
-            preview_due = overlay is not None and now >= next_preview_due
-            if not sample_due and not preview_due:
-                wake_at = min(next_due, next_preview_due) if overlay is not None else next_due
-                time.sleep(min(KEY_POLL_SECONDS, max(0, wake_at - now)))
+            if REPORT_INTERVAL_SECONDS > 0 and now - report_started >= REPORT_INTERVAL_SECONDS:
+                elapsed = now - report_started
+                with recording_lock:
+                    captured = recording_state.get("preview_count", 0)
+                painted = overlay.paint_count if overlay is not None else 0
+                mean_ms = sum(inference_times) / len(inference_times) if inference_times else 0
+                ordered = sorted(inference_times)
+                p95_ms = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))] if ordered else 0
+                print(f"Rates: capture {(captured - report_capture_count) / elapsed:.1f}, "
+                      f"preview {preview_results / elapsed:.1f}, model {model_calls / elapsed:.1f}, "
+                      f"paint {(painted - report_paint_count) / elapsed:.1f} FPS; "
+                      f"model + result transfer mean/p95 {mean_ms:.1f}/{p95_ms:.1f} ms "
+                      "(unchanged boxes do not repaint).")
+                report_started = now
+                report_capture_count, report_paint_count = captured, painted
+                preview_results = model_calls = 0
+                inference_times.clear()
+            sample_due = (now >= next_due or manual_save_pending) and not writer.pending.full()
+            # Capture is already paced at 60 Hz. Consume each newest frame as
+            # soon as it arrives instead of adding a second, drifting FPS gate.
+            if not sample_due and overlay is None:
+                time.sleep(min(KEY_POLL_SECONDS, max(0.001, next_due - now)))
                 continue
             with recording_lock:
                 frame = recording_state.get("frame" if sample_due else "preview_frame")
@@ -261,30 +298,35 @@ def main() -> None:
                         overlay.update(())
                     recording_lock.wait(timeout=min(KEY_POLL_SECONDS, 1 / OVERLAY_FPS))
                     continue
-                frame = frame.copy()
+                # Publishers allocate owned arrays and never mutate them.
             manual_save = manual_save_pending if sample_due else False
             if sample_due:
                 manual_save_pending = False
                 next_due = now + 1 / INFERENCE_FPS
-            next_preview_due += 1 / OVERLAY_FPS
-            if next_preview_due < now:
-                next_preview_due = now + 1 / OVERLAY_FPS
-            last_preview_time = frame_time
-            confidence = PREDICTION_CONFIDENCE if sample_due else OVERLAY_CONFIDENCE
-            if overlay is not None:
-                confidence = min(confidence, OVERLAY_CONFIDENCE)
-            result = runtime.predict(frame, confidence=confidence, max_detections=MAX_DETECTIONS)
-            rows = prediction_rows(result)
-            if overlay is not None:
+            if not sample_due:
+                last_preview_time = frame_time
+            rows = next((rows for cached_frame, rows in prediction_cache if cached_frame is frame), None)
+            if rows is None:
+                inference_start = time.perf_counter()
+                confidence = min(PREDICTION_CONFIDENCE, OVERLAY_CONFIDENCE) if overlay is not None else PREDICTION_CONFIDENCE
+                result = runtime.predict(frame, confidence=confidence, max_detections=MAX_DETECTIONS)
+                rows = prediction_rows(result)
+                inference_times.append((time.perf_counter() - inference_start) * 1000)
+                model_calls += 1
+                prediction_cache.append((frame, rows))
+            if overlay is not None and not sample_due:
                 fresh = time.perf_counter() - frame_time <= OVERLAY_MAX_AGE_SECONDS
                 overlay.update_rows(rows if fresh else (), model_names,
                                     source_size=(frame.shape[1], frame.shape[0]),
                                     confidence=OVERLAY_CONFIDENCE)
+                preview_results += int(fresh)
             if sample_due:
-                writer.session_id = session_id
-                writer.save(frame, rows, time.monotonic(), manual=manual_save, extra_metadata={
+                submitted = writer.submit(frame, rows, time.perf_counter_ns(), manual=manual_save, extra_metadata={
+                    "session_id": session_id,
                     "video": {"path": video_path.relative_to(dataset_dir).as_posix(),
                               "frame_index": frame_index, "fps": VIDEO_FPS}})
+                if manual_save and not submitted:
+                    manual_save_pending = True
             if writer.saved_count >= MAX_SAVES_PER_SESSION:
                 collecting = False
                 if overlay is not None:
@@ -308,7 +350,11 @@ def main() -> None:
                     recording_stop.set()
                     recording_thread.join()
             finally:
-                camera.release()
+                try:
+                    if writer.worker.ident is not None:
+                        writer.close()
+                finally:
+                    camera.release()
 
 
 if __name__ == "__main__":

@@ -207,24 +207,27 @@ class BackgroundCollector(SampleWriter):
         return (not self.stopping.is_set() and self.saved_count < self.options.max_saves_per_session
                 and now_ns >= self.next_due_ns and not self.pending.full())
 
-    def submit(self, frame: np.ndarray, rows: tuple[tuple[float, ...], ...], now_ns: int) -> None:
+    def submit(self, frame: np.ndarray, rows: tuple[tuple[float, ...], ...], now_ns: int,
+               *, manual=False, extra_metadata=None) -> bool:
         """Copy only sampled frames; drop a sample if disk processing is still busy."""
         self.next_due_ns = now_ns + self.period_ns
         if self.stopping.is_set() or self.pending.full():
-            return
+            return False
         try:
-            self.pending.put_nowait((frame.copy(), rows, time.monotonic()))
+            self.pending.put_nowait((frame.copy(), rows, time.monotonic(), manual,
+                                     dict(extra_metadata or {})))
+            return True
         except Full:
-            pass
+            return False
 
     def _run(self) -> None:
         while not self.stopping.is_set() or not self.pending.empty():
             try:
-                frame, rows, captured_at = self.pending.get(timeout=0.1)
+                frame, rows, captured_at, manual, extra_metadata = self.pending.get(timeout=0.1)
             except Empty:
                 continue
             try:
-                self.save(frame, rows, captured_at)
+                self.save(frame, rows, captured_at, manual=manual, extra_metadata=extra_metadata)
             except Exception as exc:
                 print(f"Data collection stopped: {exc}")
                 self.stopping.set()

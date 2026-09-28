@@ -60,6 +60,7 @@ class DetectionOverlay:
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, name="detection-overlay", daemon=True)
         self.dirty = False
+        self.paint_count = 0
 
     def start(self) -> None:
         self.thread.start()
@@ -264,6 +265,7 @@ class DetectionOverlay:
                                    hdc, left, top, win32con.SRCCOPY)
             finally:
                 win32gui.EndPaint(hwnd, paint)
+                self.paint_count += 1
             return 0
         if message == win32con.WM_CLOSE:
             win32gui.DestroyWindow(hwnd)
