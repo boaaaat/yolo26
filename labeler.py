@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -129,6 +130,19 @@ def read_labels(label_path: Path, width: int, height: int, class_count: int) -> 
                 min(width, (cx+w/2)*width), min(height, (cy+h/2)*height))
             for cls,cx,cy,w,h in read_yolo_labels(label_path, class_count,
                 missing_ok=True, tolerance=(0.01/width, 0.01/height))]
+
+
+def yolo_axis(start: float, end: float, extent: int) -> tuple[str, str]:
+    """Round an axis for YOLO without letting its saved edges cross the image boundary."""
+    scale = 10**10
+    center_units = round((start + end) * scale / (2 * extent))
+    size_units = round((end - start) * scale / extent)
+    while size_units > 0:
+        center, size = center_units / scale, size_units / scale
+        if center - size / 2 >= 0 and center + size / 2 <= 1:
+            return f"{center:.10f}", f"{size:.10f}"
+        size_units -= 1
+    raise ValueError("box is too small to save at YOLO label precision")
 
 
 def accepted_signature(boxes: list[Box]) -> tuple:
@@ -382,6 +396,10 @@ class LabelCanvas(QGraphicsView):
                     box.y1 = min(point.y(), box.y2 - MIN_BOX_SIZE)
                 if "s" in handle:
                     box.y2 = max(point.y(), box.y1 + MIN_BOX_SIZE)
+            box.x1 = max(0.0, min(self.image_width, box.x1))
+            box.x2 = max(0.0, min(self.image_width, box.x2))
+            box.y1 = max(0.0, min(self.image_height, box.y1))
+            box.y2 = max(0.0, min(self.image_height, box.y2))
             self.boxes[drag["index"]] = box
             self.redraw()
         event.accept()
@@ -1132,6 +1150,9 @@ class LabelerWindow(QMainWindow):
         left_layout.addWidget(self._button("Open dataset…", self.open_dataset))
         left_layout.addWidget(self._button("Open unlabeled", self.open_unlabeled))
         left_layout.addWidget(self._button("Open labeled", self.open_labeled))
+        self.finish_all_button = self._button("Move finished to Labeled", self.finish_all)
+        self.finish_all_button.setToolTip("Move images with saved labels, including negatives. Leave unlabeled images and pending suggestions in the queue.")
+        left_layout.addWidget(self.finish_all_button)
         left_layout.addWidget(self._button("Browse dataset splits…", self.browse_dataset))
         self.import_button = self._button("Import ZIP…", self.import_zip)
         left_layout.addWidget(self.import_button)
@@ -1583,6 +1604,7 @@ class LabelerWindow(QMainWindow):
         self.folder_label.setText(str(self.source_dir))
         self.folder_label.setToolTip(f"Images: {self.source_dir}\nLabels: {self.labels_dir}")
         self.finish_button.setEnabled(self.source_dir == self.dataset_dir / "unlabeled")
+        self.finish_all_button.setEnabled(self.source_dir == self.dataset_dir / "unlabeled")
         self.queue_count.setText(f"{len(images)} images · {sum(self.label_path(path).exists() for path in images)} labeled")
         self.apply_filter()
         if select_row is not None and images:
@@ -1905,11 +1927,13 @@ class LabelerWindow(QMainWindow):
                     0 <= box.x1 < box.x2 <= width and 0 <= box.y1 < box.y2 <= height):
                 QMessageBox.warning(self, "Invalid box", "Fix boxes that extend outside the image before saving.")
                 return False
-            cx = (box.x1 + box.x2) / (2 * width)
-            cy = (box.y1 + box.y2) / (2 * height)
-            bw = (box.x2 - box.x1) / width
-            bh = (box.y2 - box.y1) / height
-            lines.append(f"{box.class_id} {cx:.10f} {cy:.10f} {bw:.10f} {bh:.10f}")
+            try:
+                cx, bw = yolo_axis(box.x1, box.x2, width)
+                cy, bh = yolo_axis(box.y1, box.y2, height)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid box", str(exc))
+                return False
+            lines.append(f"{box.class_id} {cx} {cy} {bw} {bh}")
         label_path = self.label_path(self.current_path)
         try:
             content = "\n".join(lines) + ("\n" if lines else "")
@@ -1937,29 +1961,12 @@ class LabelerWindow(QMainWindow):
             return
         image_path = self.current_path
         label_path = self.label_path(image_path)
-        destination_images = self.dataset_dir / "labeled" / "images"
-        destination_labels = self.dataset_dir / "labeled" / "labels"
-        destination_images.mkdir(parents=True, exist_ok=True)
-        destination_labels.mkdir(parents=True, exist_ok=True)
-        image_target = destination_images / image_path.name
-        label_target = destination_labels / label_path.name
-        review_source = metadata_path(image_path)
-        review_target = metadata_path(image_target)
-        if image_target.exists() or label_target.exists() or (review_source.exists() and review_target.exists()):
-            QMessageBox.warning(self, "Name collision", f"A destination file already exists for {image_path.name}.")
-            return
-        moves = [(image_path, image_target), (label_path, label_target)]
-        if review_source.exists():
-            review_target.parent.mkdir(parents=True, exist_ok=True)
-            moves.append((review_source, review_target))
-        completed = []
         try:
-            for source, target in moves:
-                source.rename(target)
-                completed.append((source, target))
+            self._move_to_labeled(image_path, label_path)
+        except FileExistsError as exc:
+            QMessageBox.warning(self, "Name collision", str(exc))
+            return
         except OSError as exc:
-            for source, target in reversed(completed):
-                target.rename(source)
             QMessageBox.critical(self, "Move failed", str(exc))
             return
         row = self.image_list.currentRow()
@@ -1969,6 +1976,83 @@ class LabelerWindow(QMainWindow):
         self.refresh_queue(select_row=row)
         self._save_session()
         self.statusBar().showMessage(f"Moved {image_path.name} and {label_path.name} to labeled")
+
+    def _move_to_labeled(self, image_path: Path, label_path: Path) -> None:
+        destination_images = self.dataset_dir / "labeled" / "images"
+        destination_labels = self.dataset_dir / "labeled" / "labels"
+        destination_images.mkdir(parents=True, exist_ok=True)
+        destination_labels.mkdir(parents=True, exist_ok=True)
+        image_target = destination_images / image_path.name
+        label_target = destination_labels / label_path.name
+        review_source = metadata_path(image_path)
+        review_target = metadata_path(image_target)
+        if image_target.exists() or label_target.exists() or (review_source.exists() and review_target.exists()):
+            raise FileExistsError(f"A destination file already exists for {image_path.name}.")
+        moves = [(image_path, image_target), (label_path, label_target)]
+        if review_source.exists():
+            review_target.parent.mkdir(parents=True, exist_ok=True)
+            moves.append((review_source, review_target))
+        completed = []
+        try:
+            for source, target in moves:
+                source.rename(target)
+                completed.append((source, target))
+        except OSError:
+            for source, target in reversed(completed):
+                target.rename(source)
+            raise
+
+    def finish_all(self) -> None:
+        if self.source_dir != self.dataset_dir / "unlabeled":
+            return
+        images = sorted(path for path in self.source_dir.iterdir()
+                        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+        candidates = [path for path in images if self.label_path(path).is_file()]
+        if not candidates:
+            self.statusBar().showMessage("No images with saved labels to move")
+            return
+        if self.current_path in candidates and not any(box.suggested for box in self.canvas.boxes):
+            if not self.save_current(force=False) or not self._sync_review_state():
+                return
+        stem_counts = Counter(path.stem.casefold() for path in images)
+        skipped = []
+        moved = 0
+        for image_path in candidates:
+            label_path = self.label_path(image_path)
+            if stem_counts[image_path.stem.casefold()] > 1:
+                skipped.append(f"{image_path.name}: another image shares its label filename")
+                continue
+            if image_path == self.current_path and any(box.suggested for box in self.canvas.boxes):
+                skipped.append(f"{image_path.name}: suggestions need review")
+                continue
+            try:
+                review_data = load_review_metadata(image_path)
+                if review_data is not None and review_data["boxes"]:
+                    skipped.append(f"{image_path.name}: suggestions need review")
+                    continue
+                read_yolo_labels(label_path, len(self.class_names))
+                self._move_to_labeled(image_path, label_path)
+            except (OSError, ValueError) as exc:
+                skipped.append(f"{image_path.name}: {exc}")
+                continue
+            moved += 1
+        row = max(0, self.image_list.currentRow())
+        selected_name = self.current_path.name if self.current_path and self.current_path.is_file() else None
+        if selected_name is None:
+            self.current_path = None
+            self.review_data = None
+            self.review_info.clear()
+        self.refresh_queue(select_row=row, select_name=selected_name)
+        self._save_session()
+        unlabeled_count = len(images) - len(candidates)
+        self.statusBar().showMessage(
+            f"Moved {moved} finished images; {unlabeled_count} without labels stayed; {len(skipped)} skipped"
+        )
+        if skipped:
+            details = "\n".join(skipped[:10])
+            if len(skipped) > 10:
+                details += f"\n…and {len(skipped) - 10} more"
+            QMessageBox.information(self, "Some images stayed in Unlabeled", details)
 
     def previous_image(self) -> None:
         self._step_image(-1)
