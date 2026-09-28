@@ -3,10 +3,10 @@
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
-import dxcam
 import win32api
 
 
@@ -47,84 +47,107 @@ def watch_hotkeys(
         shutdown_event.wait(KEY_POLL_SECONDS)
 
 
-def record_once(camera, ffmpeg_path: str, stop_event: threading.Event) -> Path:
-    output_dir = Path(OUTPUT_DIR).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    video_path = output_dir / f"recording_{datetime.now():%Y%m%d_%H%M%S_%f}.mp4"
+def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threading.Event,
+                 *, fps: int, preset: str, quality: int, on_frame=None, paced=False) -> int:
+    """Encode native-resolution frames; optionally publish each encoded frame for review."""
+    if not isinstance(fps, int) or fps <= 0:
+        raise ValueError("FPS must be a positive integer")
+    if video_path.exists():
+        raise FileExistsError(video_path)
     log_path = video_path.with_suffix(".ffmpeg.log")
-    process = None
-    log_file = None
+    partial_path = video_path.with_name(f".{video_path.stem}.partial.mp4")
+    process = log_file = None
+    exit_code = None
+    camera_started = False
     frame_count = 0
-
     try:
-        camera.start(target_fps=FPS, video_mode=True)
+        camera.start(target_fps=fps, video_mode=True)
+        camera_started = True
         frame = camera.get_latest_frame(copy=True)
         if frame is None:
             raise RuntimeError("DXcam did not provide a frame")
         height, width = frame.shape[:2]
-
         command = [
-            ffmpeg_path,
-            "-hide_banner", "-loglevel", "error", "-n",
+            ffmpeg_path, "-hide_banner", "-loglevel", "error", "-n",
             "-f", "rawvideo", "-pixel_format", "bgr24",
-            "-video_size", f"{width}x{height}", "-framerate", str(FPS),
-            "-i", "pipe:0",
-            "-an", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
-            "-rc", "vbr", "-cq", str(NVENC_QUALITY), "-b:v", "0",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(video_path),
+            "-video_size", f"{width}x{height}", "-framerate", str(fps),
+            "-i", "pipe:0", "-an", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "h264_nvenc", "-preset", preset,
+            "-rc", "vbr", "-cq", str(quality), "-b:v", "0",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial_path),
         ]
         log_file = log_path.open("wb")
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        print(f"Recording to {video_path} at {FPS} FPS. Press - to stop.")
-
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                   stderr=log_file, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        next_frame_at = time.monotonic()
         while not stop_event.is_set():
             if process.poll() is not None:
                 raise RuntimeError(f"FFmpeg stopped unexpectedly. See {log_path}")
+            if paced:
+                delay = next_frame_at - time.monotonic()
+                if delay > 0 and stop_event.wait(delay):
+                    break
+                frame = camera.get_latest_frame(copy=True)
+                if frame is None:
+                    continue
             if frame.shape[:2] != (height, width):
                 raise RuntimeError("Screen size changed during recording")
             try:
                 process.stdin.write(frame.tobytes())
-            except BrokenPipeError as exc:
+            except (BrokenPipeError, OSError) as exc:
                 raise RuntimeError(f"FFmpeg could not accept frames. See {log_path}") from exc
+            if on_frame is not None:
+                on_frame(frame, frame_count)
             frame_count += 1
-            next_frame = camera.get_latest_frame(copy=True)
-            if next_frame is not None:
-                frame = next_frame
+            if paced:
+                next_frame_at += 1 / fps
+                if next_frame_at < time.monotonic() - 1 / fps:
+                    next_frame_at = time.monotonic()
+            else:
+                next_frame = camera.get_latest_frame(copy=True)
+                if next_frame is not None:
+                    frame = next_frame
     finally:
-        if camera.is_capturing:
-            camera.stop()
-        if process is not None:
-            if process.stdin is not None:
+        try:
+            if camera_started and camera.is_capturing:
+                camera.stop()
+        finally:
+            if process is not None:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
                 try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            try:
-                exit_code = process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                exit_code = process.returncode
-        else:
-            exit_code = None
-        if log_file is not None:
-            log_file.close()
-
+                    exit_code = process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    exit_code = process.returncode
+            if log_file is not None:
+                log_file.close()
+            if process is not None and exit_code == 0:
+                # Same-directory rename publishes only a finalized video.
+                partial_path.replace(video_path)
+                print(f"Saved {video_path} ({frame_count} frames at {fps} FPS).")
     if exit_code != 0:
         raise RuntimeError(f"FFmpeg exited with code {exit_code}. See {log_path}")
-    print(f"Saved {video_path} ({frame_count} frames). Press = to record again.")
+    return frame_count
+
+
+def record_once(camera, ffmpeg_path: str, stop_event: threading.Event) -> Path:
+    output_dir = Path(OUTPUT_DIR).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_path = output_dir / f"recording_{datetime.now():%Y%m%d_%H%M%S_%f}.mp4"
+    print(f"Recording to {video_path} at {FPS} FPS. Press - to stop.")
+    record_video(camera, ffmpeg_path, video_path, stop_event,
+                 fps=FPS, preset=NVENC_PRESET, quality=NVENC_QUALITY)
+    print("Press = to record again.")
     return video_path
 
 
 def main() -> None:
+    import dxcam
     if not isinstance(FPS, int) or FPS <= 0:
         raise ValueError("FPS must be a positive integer")
     ffmpeg_path = shutil.which(FFMPEG_EXECUTABLE)

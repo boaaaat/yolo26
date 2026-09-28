@@ -11,6 +11,8 @@ from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 from dataset_project import latest_generated_version
 
+from dataset_utils import (normalize_names)
+
 
 # Change these values here; this script has no command line arguments.
 ROOT = Path(__file__).resolve().parent
@@ -27,9 +29,7 @@ def main() -> None:
     train_images = version / "train" / "images"
     train_labels = version / "train" / "labels"
     data = yaml.safe_load((version / "data.yaml").read_text(encoding="utf-8"))
-    names = data["names"]
-    if isinstance(names, dict):
-        names = [value for _, value in sorted(names.items(), key=lambda pair: int(pair[0]))]
+    names = normalize_names(data["names"])
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(MODEL_PATH)
 

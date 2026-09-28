@@ -4,8 +4,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 
 from dataset_project import latest_generated_version, recent_dataset
-from training_dashboard import TrainingDashboard
-from ultralytics import YOLO
+from training_dashboard import attach_dashboard
 
 
 # Use the latest generated version in the most recently opened dataset.
@@ -30,7 +29,18 @@ CONTINUE_RUN_NAME = f"{RUN_NAME}_continue"
 OPEN_DASHBOARD = True  # Open a live browser dashboard; a PNG is also saved in the run folder.
 
 
+def resume_checkpoint_state(checkpoint: dict | None, error_message: str):
+    """Validate resumability; callers retain their normal/distillation-specific policy."""
+    saved = checkpoint or {}
+    arguments = saved.get("train_args") or {}
+    epoch, epochs = saved.get("epoch", -1), arguments.get("epochs", 0)
+    if epoch < 0 or saved.get("optimizer") is None or epoch + 1 >= epochs:
+        raise ValueError(error_message)
+    return arguments, epoch, epochs
+
+
 def main() -> None:
+    from ultralytics import YOLO
     if DATASET_PATH is None:
         dataset_root = recent_dataset(Path(__file__).resolve().parent / "datasets" / "rivals")
         dataset_path = latest_generated_version(dataset_root)
@@ -54,20 +64,12 @@ def main() -> None:
             raise FileNotFoundError(f"Training checkpoint not found: {checkpoint}")
         model = YOLO(str(checkpoint))
 
-    dashboard = TrainingDashboard(open_browser=OPEN_DASHBOARD)
-    model.add_callback("on_train_start", dashboard.start)
-    model.add_callback("on_fit_epoch_end", dashboard.update)
-    model.add_callback("on_train_end", dashboard.finish)
+    attach_dashboard(model, open_browser=OPEN_DASHBOARD)
 
     if TRAIN_MODE == "resume":
-        saved = model.ckpt or {}
-        saved_epoch = saved.get("epoch", -1)
-        saved_epochs = saved.get("train_args", {}).get("epochs", 0)
-        if saved_epoch < 0 or saved.get("optimizer") is None or saved_epoch + 1 >= saved_epochs:
-            raise ValueError(
-                "This checkpoint cannot resume an interrupted run. "
-                "Set TRAIN_MODE = 'continue' to train further from its weights."
-            )
+        resume_checkpoint_state(model.ckpt,
+            "This checkpoint cannot resume an interrupted run. "
+            "Set TRAIN_MODE = 'continue' to train further from its weights.")
         # Ultralytics restores the saved epoch, optimizer, and original total epochs.
         # EPOCHS and RUN_NAME below do not change the interrupted run.
         model.train(

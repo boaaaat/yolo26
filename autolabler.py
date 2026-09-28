@@ -5,6 +5,11 @@ from pathlib import Path
 import yaml
 from ultralytics import YOLO, YOLOE
 
+from dataset_utils import (
+    class_name_map, normalize_names, normalized_predictions,
+    write_yolo_labels, image_files,
+)
+
 
 # Settings
 MODEL_SOURCE = "trained"  # "trained" or "yoloe"; trained is much better on this Roblox dataset.
@@ -29,18 +34,13 @@ IMAGE_SIZE = 1024
 DEVICE = 0  # First NVIDIA GPU; use "cpu" if needed.
 OVERWRITE_EXISTING_LABELS = False
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-
 
 def main() -> None:
     image_dir = Path(IMAGE_DIR).expanduser().resolve()
     if not image_dir.is_dir():
         raise NotADirectoryError(f"Image folder not found: {image_dir}")
 
-    images = sorted(
-        path for path in image_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
-    )
+    images = sorted(image_files(image_dir))
     if not images:
         raise ValueError(f"No images found in {image_dir}")
     if len({path.stem.casefold() for path in images}) != len(images):
@@ -52,11 +52,7 @@ def main() -> None:
     label_dir.mkdir(parents=True, exist_ok=True)
 
     data = yaml.safe_load(Path(DATA_YAML).expanduser().resolve().read_text(encoding="utf-8"))
-    dataset_names = data["names"]
-    if isinstance(dataset_names, dict):
-        dataset_names = [name for _, name in sorted(dataset_names.items(), key=lambda pair: int(pair[0]))]
-    if not isinstance(dataset_names, list) or not dataset_names:
-        raise ValueError("DATA_YAML must contain an ordered list of class names")
+    dataset_names = normalize_names(data["names"])
 
     if MODEL_SOURCE == "trained":
         checkpoint = Path(CHECKPOINT_PATH).expanduser().resolve()
@@ -79,7 +75,7 @@ def main() -> None:
     else:
         raise ValueError("MODEL_SOURCE must be 'trained' or 'yoloe'")
 
-    class_names = dict(model.names.items()) if isinstance(model.names, dict) else dict(enumerate(model.names))
+    class_names = class_name_map(model.names)
     model_names = set(class_names.values())
     if not model_names.issubset(dataset_names):
         raise ValueError(
@@ -106,23 +102,16 @@ def main() -> None:
             device=DEVICE,
             verbose=False,
         )[0]
-        lines = []
-        if result.boxes is not None:
-            for box in result.boxes:
-                class_id = int(box.cls.item())
-                class_name = class_names[class_id]
-                if float(box.conf.item()) < thresholds.get(class_name, default_threshold):
-                    continue
-                dataset_class_id = dataset_names.index(class_name)
-                x, y, width, height = box.xywhn[0].tolist()
-                lines.append(
-                    f"{dataset_class_id} {x:.6f} {y:.6f} {width:.6f} {height:.6f}"
-                )
-
+        labels = []
+        dataset_ids = {name: index for index, name in enumerate(dataset_names)}
+        for class_id, cx, cy, width, height, confidence in normalized_predictions(result):
+            class_name = class_names[class_id]
+            if confidence >= thresholds.get(class_name, default_threshold):
+                labels.append((dataset_ids[class_name], cx, cy, width, height))
         # An empty file is the YOLO label for an image with no accepted objects.
-        label_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        write_yolo_labels(label_path, labels, precision=6)
         written += 1
-        print(f"{image_path.name} -> {label_path.name}: {len(lines)} objects")
+        print(f"{image_path.name} -> {label_path.name}: {len(labels)} objects")
 
     print(f"Done: wrote {written} labels, skipped {skipped} existing labels in {label_dir}")
 

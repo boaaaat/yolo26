@@ -1,6 +1,5 @@
 """Read-only browser for images and YOLO labels in generated dataset splits."""
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,8 +13,9 @@ from PySide6.QtWidgets import (
 
 from dataset_project import DEFAULT_COLORS, DatasetProject
 
+from dataset_utils import (label_class_ids, IMAGE_SUFFIXES, read_yolo_labels, normalize_names)
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 SPLITS = ("train", "valid", "test")
 
 
@@ -42,49 +42,9 @@ def dataset_versions(root: Path) -> list[Path]:
     return versions
 
 
-def label_class_ids(path: Path) -> frozenset[int]:
-    if not path.is_file():
-        return frozenset()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return frozenset()  # A detailed error appears when the image is selected.
-    class_ids = set()
-    for line in lines:
-        parts = line.split()
-        if parts:
-            try:
-                class_ids.add(int(parts[0]))
-            except ValueError:
-                continue
-    return frozenset(class_ids)
-
-
 def read_boxes(path: Path, width: int, height: int, class_count: int) -> list[tuple[int, float, float, float, float]]:
-    if not path.is_file():
-        return []
-    boxes = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        parts = line.split()
-        if len(parts) != 5:
-            raise ValueError(f"{path.name}, line {line_number}: expected five values")
-        try:
-            class_id = int(parts[0])
-            cx, cy, box_width, box_height = (float(value) for value in parts[1:])
-        except ValueError as exc:
-            raise ValueError(f"{path.name}, line {line_number}: invalid number") from exc
-        if (not 0 <= class_id < class_count or
-                not all(math.isfinite(value) and 0 <= value <= 1
-                        for value in (cx, cy, box_width, box_height)) or
-                box_width <= 0 or box_height <= 0 or
-                cx - box_width / 2 < -1e-5 or cy - box_height / 2 < -1e-5 or
-                cx + box_width / 2 > 1 + 1e-5 or cy + box_height / 2 > 1 + 1e-5):
-            raise ValueError(f"{path.name}, line {line_number}: class or box out of range")
-        boxes.append((class_id, (cx - box_width / 2) * width, (cy - box_height / 2) * height,
-                      box_width * width, box_height * height))
-    return boxes
+    return [(cls, (cx-w/2)*width, (cy-h/2)*height, w*width, h*height)
+            for cls,cx,cy,w,h in read_yolo_labels(path, class_count, missing_ok=True, tolerance=1e-5)]
 
 
 class DatasetPreview(QGraphicsView):
@@ -209,11 +169,7 @@ class DatasetBrowserDialog(QDialog):
             data = yaml.safe_load((root / "data.yaml").read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("data.yaml must contain a mapping")
-            names = data.get("names")
-            if isinstance(names, dict):
-                names = [name for _, name in sorted(names.items(), key=lambda pair: int(pair[0]))]
-            if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-                raise ValueError("data.yaml has invalid class names")
+            names = normalize_names(data.get("names"))
             self.names = names
             palette = {name.casefold(): color for name, color in zip(self.project.names, self.project.colors)}
             self.colors = [palette.get(name.casefold(), DEFAULT_COLORS[index % len(DEFAULT_COLORS)])

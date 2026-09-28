@@ -6,14 +6,14 @@ then press =. Press Ctrl+C to cancel.
 
 import ctypes
 import json
-import os
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import win32api
 import win32con
+
+from dataset_utils import (atomic_write)
 
 
 CALIBRATION_PATH = Path(__file__).resolve().parent / "mouse_calibration.json"
@@ -56,16 +56,7 @@ def main() -> None:
                     "screen_height": height,
                     "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
                 }
-                descriptor, temporary = tempfile.mkstemp(
-                    prefix=".mouse-calibration-", suffix=".tmp", dir=CALIBRATION_PATH.parent
-                )
-                try:
-                    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                        json.dump(data, output, indent=2)
-                        output.write("\n")
-                    os.replace(temporary, CALIBRATION_PATH)
-                finally:
-                    Path(temporary).unlink(missing_ok=True)
+                atomic_write(CALIBRATION_PATH, json.dumps(data, indent=2) + "\n")
                 print(f"Saved locked cursor position ({x}, {y}) to {CALIBRATION_PATH}")
                 return
             was_down = is_down

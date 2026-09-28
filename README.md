@@ -2,6 +2,18 @@
 
 Python tools for labeling object detection images, generating versioned YOLO datasets, and training a YOLO26 model. The labeler is a PySide6 desktop app. It starts with `datasets/rivals/unlabeled` and switches between the unlabeled and labeled folders of the selected dataset root.
 
+## Shared helpers
+
+Run the existing scripts directly and edit their settings at the top as before. All scripts remain in the repository root.
+
+- `dataset_utils.py` shares YOLO label parsing/writing, class-name handling, image discovery, atomic file writes, and bulk prediction transfers. Callers retain their own label boundary tolerances and missing-file policies.
+- `inference_controls.py` shares target matching, aim state, mouse controls, calibration loading, and timing. Each bot passes its own options; the FP32 entry point passes overrides to the original PyTorch loop without changing its module globals. TensorRT and PyTorch keep their existing inference pipelines.
+- `inference_collection.py` shares candidate selection, duplicate rejection, numbering, and image/review saving. Active collection calls the writer directly; live inference uses its bounded background queue. Collection settings remain in `active_collector.py`.
+- `recorder.py` exposes the encoder used by both standalone recording and active collection, with an optional review-frame callback. Completed recordings are finalized from a partial MP4.
+- `training_dashboard.py` registers common dashboard callbacks, and `train.py` exposes the checkpoint-resume check reused by distillation. Training modes and dashboard behavior remain unchanged.
+
+The labeler, auto-labeler, and active collector copy detection boxes from GPU to CPU once per result. This refactor has only been reviewed statically; no tests, smoke tests, engine builds, or performance benchmarks were run.
+
 ## Optimized inference on RTX 5070 / 5080
 
 `optimized_inference_bot.py` uses the medium checkpoint with a fixed rectangular FP16 TensorRT engine. It preserves the original 1024-pixel long-edge scale and full-screen coverage: a 3840x2160 or 2560x1440 display uses a 1024x576 input instead of adding padding to 1024x1024. Other aspect ratios receive only the padding needed for a stride of 32. No crosshair crop or automatic resolution reduction is used. Removing padding changes boundary context, and FP16 can change predictions; accuracy and the 120 FPS target have not been measured.
@@ -16,7 +28,7 @@ python optimized_inference_bot.py
 
 The pinned TensorRT 10.16.1 CUDA 13 package includes the native builder/runtime libraries and Python bindings. A separate SDK ZIP or Python interpreter is unnecessary for this implementation. It does not install `trtexec`. The existing CUDA PyTorch and Ultralytics installation remains required; this implementation uses the `quantize` export API in Ultralytics 8.4.162. DXcam must support `grab(copy=False, new_frame_only=True)` (the installed DXcam does). Optional fused preprocessing uses the existing `triton-windows` installation, with a PyTorch CUDA fallback when unavailable.
 
-Settings are at the top of `optimized_inference_bot.py`. `draw_boxes_overlay` and `collect_data` default to `False`; enable either independently if wanted. The 120 FPS target applies with both off. Existing calibration is required for live operation (`python calibrate.py`). Press `=` to arm, `-` to pause, and Ctrl+C to exit. Target matching and mouse/shooting behavior reuse `inference_bot.py`; common control settings are exposed in the optimized entry point.
+Settings are at the top of `optimized_inference_bot.py`. Your current `draw_boxes_overlay` setting is `True`, and `collect_data` is `False`; set both to `False` for the 120 FPS target. Existing calibration is required for live operation (`python calibrate.py`). Press `=` to arm, `-` to pause, and Ctrl+C to exit. Target matching and mouse/shooting behavior use `inference_controls.py`; control settings are exposed in the optimized entry point.
 
 The first launch exports/builds an engine in a separate process; this can take several minutes and use substantial GPU resources. Later launches reuse `.optimized_engine_cache/` when the checkpoint contents, shape, GPU, precision, and software versions match. Export intermediates stay in a temporary cache directory, leaving training checkpoints untouched. Each GPU builds its own engine. To build the engine without starting capture or controls:
 

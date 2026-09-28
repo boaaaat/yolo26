@@ -15,7 +15,8 @@ import torch
 import win32api
 import win32con
 
-import inference_bot as controls
+import inference_controls as controls
+from inference_controls import wait_until as sleep_until
 from calibrate import make_dpi_aware
 from optimized_capture import FrameGeometry, LatestCapture
 from optimized_engine import ensure_engine
@@ -35,15 +36,14 @@ FUSED_PREPROCESSING = True  # Uses triton-windows when available; otherwise CUDA
 OPENCV_THREADS = 2
 CONFIDENCE = 0.50
 ENEMY_CLASS_NAME = "enemy"
-draw_boxes_overlay = False
+draw_boxes_overlay = True
 collect_data = False
 MAX_TARGET_DETECTIONS = 20
 MAX_DISPLAY_DETECTIONS = 100
 MAX_RESULT_AGE_SECONDS = 0.100
 REPORT_INTERVAL_SECONDS = 5.0
 
-# Existing behavior is reused from inference_bot; these override its settings only
-# inside this separate process. The original scripts and their settings are unchanged.
+# Shared control helpers receive these settings explicitly; each bot keeps its own options.
 AUTO_SHOOT = True
 instant_mouse = False
 MOUSE_UPDATE_HZ = 240
@@ -51,21 +51,19 @@ AIM_HEIGHT_FROM_BOTTOM = 0.90
 AIM_TIME_CONSTANT_SECONDS = 0.030
 MAX_MOUSE_STEP_PIXELS = 70
 TARGET_LOST_FRAMES = 4
-
-
-def sleep_until(deadline_ns: int, running: threading.Event) -> bool:
-    """Release the GIL while waiting; avoid the original Python busy-spin tail."""
-    while running.is_set():
-        remaining = (deadline_ns - time.perf_counter_ns()) / 1_000_000_000
-        if remaining <= 0:
-            return True
-        time.sleep(min(remaining, 0.002))
-    return False
+SHOOT_INTERVAL_SECONDS = 0.10
+SHOOT_HOLD_SECONDS = 0.09
+TARGET_MATCH_MIN_IOU = 0.10
+TARGET_MATCH_MAX_CENTER_DISTANCE = 0.65
+TARGET_MATCH_MAX_AREA_RATIO = 4.0
+START_KEY = 0xBB
+STOP_KEY = 0xBD
+HOTKEY_POLL_SECONDS = 0.003
 
 
 class TimedAimState(controls.AimState):
-    def __init__(self, center):
-        super().__init__(center)
+    def __init__(self, center, options):
+        super().__init__(center, options)
         self.lock = threading.RLock()
         self.arm_generation = 0
         self.result_started_ns = 0
@@ -94,13 +92,6 @@ class TimedAimState(controls.AimState):
                     self.clear()
                 return None, None, self.generation
             return super().snapshot()
-
-
-def configure_controls():
-    for name in ("AUTO_SHOOT", "instant_mouse", "MOUSE_UPDATE_HZ", "AIM_HEIGHT_FROM_BOTTOM",
-                 "AIM_TIME_CONSTANT_SECONDS", "MAX_MOUSE_STEP_PIXELS", "TARGET_LOST_FRAMES"):
-        setattr(controls, name, globals()[name])
-    controls.wait_until = sleep_until
 
 
 def main():
@@ -135,7 +126,6 @@ def main():
     if args.build_only:
         return
 
-    configure_controls()
     cv2.setNumThreads(OPENCV_THREADS)
     runner = TensorRTRunner(path, geometry.height, geometry.width, GPU_INDEX,
                            USE_CUDA_GRAPH, FUSED_PREPROCESSING)
@@ -146,7 +136,7 @@ def main():
     if len(enemy_ids) != 1:
         raise ValueError(f"Expected one {ENEMY_CLASS_NAME!r} class, found {names}")
     enemy_id = enemy_ids[0]
-    state = TimedAimState(center)
+    state = TimedAimState(center, controls.ControlOptions.from_settings(globals(), spin_guard_ns=0))
     overlay = collector = capture = None
     threads = []
     try:
@@ -156,8 +146,9 @@ def main():
             overlay.start()
         if collect_data:
             from inference_collection import BackgroundCollector
+            from active_collector import collection_options
             try:
-                collector = BackgroundCollector(checkpoint, names)
+                collector = BackgroundCollector(checkpoint, names, collection_options())
                 collector.start()
             except Exception as exc:
                 print(f"Collection unavailable: {exc}")

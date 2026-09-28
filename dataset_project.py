@@ -1,12 +1,12 @@
 """Dataset-local class definitions and labeler session state."""
 
-import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+from dataset_utils import (atomic_write, normalize_names)
 
 
 DEFAULT_COLORS = ("#ff6b6b", "#ffc857", "#56d6a5", "#71b7ff", "#c995ff")
@@ -26,32 +26,13 @@ def _parent_dataset_root(folder: Path) -> Path | None:
     return parent_root
 
 
-def _atomic_write(path: Path, content: str | bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", suffix=".tmp", dir=path.parent)
-    os.close(descriptor)
-    try:
-        temp_path = Path(temporary)
-        if isinstance(content, bytes):
-            temp_path.write_bytes(content)
-        else:
-            temp_path.write_text(content, encoding="utf-8")
-        os.replace(temp_path, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-
-
 def _names_from_data(path: Path) -> list[str] | None:
     if not path.is_file():
         return None
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Invalid dataset YAML: {path}")
-    names = data.get("names")
-    if isinstance(names, dict):
-        names = [value for _, value in sorted(names.items(), key=lambda pair: int(pair[0]))]
-    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-        raise ValueError(f"Invalid class names in {path}")
+    names = normalize_names(data.get("names"))
     if data.get("nc", len(names)) != len(names):
         raise ValueError(f"Class count does not match names in {path}")
     return names
@@ -126,7 +107,7 @@ class DatasetProject:
         }, sort_keys=False)
 
     def save_state(self) -> None:
-        _atomic_write(self.state_path, self._payload())
+        atomic_write(self.state_path, self._payload())
 
     def save_classes(self, classes: list[dict]) -> None:
         classes = _validate_classes(classes)
@@ -139,14 +120,14 @@ class DatasetProject:
             raise ValueError(f"Invalid dataset YAML: {data_path}")
         data["nc"] = len(classes)
         data["names"] = [entry["name"] for entry in classes]
-        _atomic_write(data_path, yaml.safe_dump(data, sort_keys=False))
+        atomic_write(data_path, yaml.safe_dump(data, sort_keys=False))
         try:
-            _atomic_write(self.state_path, self._payload(classes))
+            atomic_write(self.state_path, self._payload(classes))
         except Exception:
             if previous is None:
                 data_path.unlink(missing_ok=True)
             else:
-                _atomic_write(data_path, previous)
+                atomic_write(data_path, previous)
             raise
         self.classes = classes
 
@@ -218,7 +199,7 @@ def recent_dataset(default_root: Path) -> Path:
 
 
 def remember_dataset(root: Path) -> None:
-    _atomic_write(RECENT_DATASET_FILE, yaml.safe_dump({"last_dataset": str(root)}, sort_keys=False))
+    atomic_write(RECENT_DATASET_FILE, yaml.safe_dump({"last_dataset": str(root)}, sort_keys=False))
 
 
 def latest_generated_version(root: Path) -> Path:

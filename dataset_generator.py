@@ -16,8 +16,9 @@ from review_metadata import (
     metadata_path,
 )
 
+from dataset_utils import (IMAGE_SUFFIXES, read_yolo_labels, write_yolo_labels)
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 SPLITS = ("train", "valid", "test")
 SPLIT_MANIFEST = "split_assignments.yaml"
 
@@ -177,38 +178,6 @@ def _assign_splits(dataset_dir: Path, images: list[CollectedImage], config: Gene
     return split_images, manifest, conflicts
 
 
-def _read_boxes(path: Path, class_count: int) -> list[tuple[int, float, float, float, float]]:
-    boxes = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        parts = line.split()
-        try:
-            if len(parts) != 5:
-                raise ValueError("expected five values")
-            class_id = int(parts[0])
-            cx, cy, width, height = map(float, parts[1:])
-            if not 0 <= class_id < class_count:
-                raise ValueError(f"class ID {class_id} is outside 0–{class_count - 1}")
-            for name, value in zip(("center x", "center y", "width", "height"),
-                                   (cx, cy, width, height)):
-                if not math.isfinite(value) or not 0 <= value <= 1:
-                    raise ValueError(f"{name} {value} is outside 0–1")
-            if width <= 0 or height <= 0:
-                raise ValueError("box width and height must be positive")
-            left, right = cx - width / 2, cx + width / 2
-            top, bottom = cy - height / 2, cy + height / 2
-            if left < 0 or right > 1 or top < 0 or bottom > 1:
-                raise ValueError(
-                    f"box extends outside image (left={left:.9f}, top={top:.9f}, "
-                    f"right={right:.9f}, bottom={bottom:.9f})"
-                )
-            boxes.append((class_id, cx, cy, width, height))
-        except ValueError as exc:
-            raise ValueError(f"{path}, line {line_number}: {exc}") from exc
-    return boxes
-
-
 def _sources(dataset_dir: Path):
     image_dir = dataset_dir / "labeled" / "images"
     label_dir = dataset_dir / "labeled" / "labels"
@@ -268,10 +237,8 @@ def _image_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_boxes(path: Path, boxes: list[tuple[int, float, float, float, float]]) -> None:
-    lines = [f"{class_id} {cx:.10f} {cy:.10f} {width:.10f} {height:.10f}"
-             for class_id, cx, cy, width, height in boxes]
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+def _write_boxes(path: Path, boxes):
+    write_yolo_labels(path, boxes)
 
 
 def _rotate_boxes(boxes, angle: float, image_width: int, image_height: int):
@@ -374,7 +341,7 @@ def generate_dataset(
         if progress and scanned % 50 == 0:
             progress(f"Reading source images and labels: {scanned} scanned...")
         try:
-            original_boxes = _read_boxes(label_path, len(class_names))
+            original_boxes = read_yolo_labels(label_path, len(class_names))
         except (ValueError, UnicodeError) as exc:
             image_target, label_target = requeue_invalid_label(dataset_dir, image_path, label_path, str(exc))
             message = (f"{exc}\nMoved image to {image_target}; original label saved at {label_target}. "

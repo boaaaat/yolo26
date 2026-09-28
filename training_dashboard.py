@@ -7,13 +7,14 @@ import json
 import math
 import os
 import statistics
-import tempfile
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+
+from dataset_utils import (atomic_write)
 
 
 BACKGROUND = "#0b1220"
@@ -252,13 +253,7 @@ The chart reads the run's saved CSV, including epochs from an interrupted run.</
 <script type="application/json" id="chart-data">{chart_json}</script>
 <script>{hover_script}</script>
 </main></body></html>"""
-    descriptor, temporary = tempfile.mkstemp(prefix=".dashboard-", suffix=".html", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(content)
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    atomic_write(path, content)
 
 
 class TrainingDashboard:
@@ -325,3 +320,12 @@ class TrainingDashboard:
 
     def finish(self, trainer) -> None:
         self.update(trainer, force=True, complete=True)
+
+
+def attach_dashboard(model, *, open_browser=True, refresh_seconds=15):
+    """Register the same per-run dashboard callbacks for training and distillation."""
+    dashboard = TrainingDashboard(open_browser=open_browser, refresh_seconds=refresh_seconds)
+    model.add_callback("on_train_start", dashboard.start)
+    model.add_callback("on_fit_epoch_end", dashboard.update)
+    model.add_callback("on_train_end", dashboard.finish)
+    return dashboard

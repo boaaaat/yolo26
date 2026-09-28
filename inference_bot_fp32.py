@@ -29,24 +29,25 @@ instant_mouse = False
 
 
 def main() -> None:
-    bot.CHECKPOINT_PATH = CHECKPOINT_PATH
-    bot.GPU_INDEX = GPU_INDEX
-    bot.DXCAM_DEVICE_INDEX = DXCAM_DEVICE_INDEX
-    bot.DXCAM_OUTPUT_INDEX = DXCAM_OUTPUT_INDEX
-    bot.IMAGE_SIZE = IMAGE_SIZE
-    bot.INFERENCE_TARGET_FPS = INFERENCE_TARGET_FPS
-    bot.CONFIDENCE = CONFIDENCE
-    bot.ENEMY_CLASS_NAME = ENEMY_CLASS_NAME
-    bot.PREDICT_NMS = False if NMS_FREE else None
-    bot.REPORT_STAGE_TIMES = REPORT_STAGE_TIMES
-    bot.WARMUP_PASSES = WARMUP_PASSES
-    bot.AUTO_SHOOT = AUTO_SHOOT
-    bot.collect_data = collect_data
-    bot.draw_boxes_overlay = draw_boxes_overlay
-    bot.instant_mouse = instant_mouse
-    bot.PRECISION = "fp32"
-    bot.COMPILE_MODE = False
-    bot.main()
+    bot.main(bot.inference_options(
+        CHECKPOINT_PATH=CHECKPOINT_PATH,
+        GPU_INDEX=GPU_INDEX,
+        DXCAM_DEVICE_INDEX=DXCAM_DEVICE_INDEX,
+        DXCAM_OUTPUT_INDEX=DXCAM_OUTPUT_INDEX,
+        IMAGE_SIZE=IMAGE_SIZE,
+        INFERENCE_TARGET_FPS=INFERENCE_TARGET_FPS,
+        CONFIDENCE=CONFIDENCE,
+        ENEMY_CLASS_NAME=ENEMY_CLASS_NAME,
+        PREDICT_NMS=False if NMS_FREE else None,
+        REPORT_STAGE_TIMES=REPORT_STAGE_TIMES,
+        WARMUP_PASSES=WARMUP_PASSES,
+        AUTO_SHOOT=AUTO_SHOOT,
+        collect_data=collect_data,
+        draw_boxes_overlay=draw_boxes_overlay,
+        instant_mouse=instant_mouse,
+        PRECISION="fp32",
+        COMPILE_MODE=False,
+    ))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,10 @@ from pathlib import Path
 import yaml
 from ultralytics import YOLO
 
-from training_dashboard import TrainingDashboard
+from training_dashboard import attach_dashboard
+from train import resume_checkpoint_state
+
+from dataset_utils import (normalize_names)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -79,12 +82,7 @@ def dataset_names(path: Path) -> list[str]:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Invalid dataset YAML: {path}")
-    names = data.get("names")
-    if isinstance(names, dict):
-        names = [name for _, name in sorted(names.items(), key=lambda item: int(item[0]))]
-    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-        raise ValueError(f"Invalid class names in {path}")
-    return names
+    return normalize_names(data.get("names"))
 
 
 def main() -> None:
@@ -100,13 +98,9 @@ def main() -> None:
         student = YOLO(str(checkpoint))
         if student.task != "detect":
             raise ValueError(f"Student checkpoint must be a detection model: {checkpoint}")
-        saved = student.ckpt or {}
-        saved_args = saved.get("train_args") or {}
-        saved_epoch = saved.get("epoch", -1)
-        saved_epochs = saved_args.get("epochs", 0)
-        if saved_epoch < 0 or saved.get("optimizer") is None or saved_epoch + 1 >= saved_epochs:
-            raise ValueError("This checkpoint cannot resume an interrupted distillation run. "
-                             "Use its unstripped last.pt before the original epoch total is reached.")
+        saved_args, saved_epoch, saved_epochs = resume_checkpoint_state(student.ckpt,
+            "This checkpoint cannot resume an interrupted distillation run. "
+            "Use its unstripped last.pt before the original epoch total is reached.")
         teacher_path = saved_args.get("distill_model")
         if not isinstance(teacher_path, str) or not teacher_path:
             raise ValueError("This checkpoint has no saved distillation teacher; it is not a distillation run.")
@@ -131,9 +125,7 @@ def main() -> None:
         teacher = YOLO(str(checkpoint))
         if teacher.task != "detect":
             raise ValueError(f"Teacher checkpoint must be a detection model: {checkpoint}")
-        teacher_names = teacher.names
-        teacher_names = ([name for _, name in sorted(teacher_names.items())]
-                         if isinstance(teacher_names, dict) else list(teacher_names))
+        teacher_names = normalize_names(teacher.names)
         names = dataset_names(data_path)
         if teacher_names != names:
             raise ValueError(f"Teacher classes {teacher_names} differ from dataset classes {names}. "
@@ -146,10 +138,7 @@ def main() -> None:
 
     if not isinstance(image_size, int) or image_size < 1:
         raise ValueError("IMAGE_SIZE or the saved imgsz must be a positive integer")
-    dashboard = TrainingDashboard(open_browser=OPEN_DASHBOARD)
-    student.add_callback("on_train_start", dashboard.start)
-    student.add_callback("on_fit_epoch_end", dashboard.update)
-    student.add_callback("on_train_end", dashboard.finish)
+    attach_dashboard(student, open_browser=OPEN_DASHBOARD)
 
     if TRAIN_MODE == "resume":
         print(f"Resuming student: {checkpoint} from epoch {saved_epoch + 2} of {saved_epochs}")

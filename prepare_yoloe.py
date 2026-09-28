@@ -6,6 +6,8 @@ from pathlib import Path
 import yaml
 from ultralytics import YOLOE
 
+from dataset_utils import (normalize_names)
+
 
 # Edit these prompts if your game's visual cues change, then rerun this script.
 ROOT = Path(__file__).resolve().parent
@@ -21,9 +23,7 @@ PROMPTS_BY_CLASS = {
 
 def main() -> None:
     dataset = yaml.safe_load(DATA_YAML.read_text(encoding="utf-8"))
-    names = dataset["names"]
-    if isinstance(names, dict):
-        names = [value for _, value in sorted(names.items(), key=lambda item: int(item[0]))]
+    names = normalize_names(dataset["names"])
     if set(names) != set(PROMPTS_BY_CLASS):
         raise ValueError(f"Set one prompt for each dataset class: {names}")
     if not MODEL_PATH.is_file():

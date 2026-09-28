@@ -87,8 +87,17 @@ def build_engine(checkpoint: Path, height: int, width: int, gpu: int, workspace:
             if sha256(copied_checkpoint) != identity["checkpoint_sha256"]:
                 raise RuntimeError("Checkpoint changed during preparation; retry after training saves it")
             model = YOLO(str(copied_checkpoint))
-            if model.task != "detect" or not getattr(model.model, "end2end", False):
-                raise ValueError("This runtime requires a YOLO26 NMS-free detection checkpoint")
+            if model.task != "detect":
+                raise ValueError(f"This runtime requires a detection checkpoint, got task {model.task!r}")
+            head = model.model.model[-1]
+            if any(getattr(head, name, None) is None for name in ("one2one_cv2", "one2one_cv3")):
+                raise ValueError("This runtime requires a checkpoint with trained one-to-one detection heads")
+            # Saved checkpoints can select one-to-many inference even when both
+            # trained heads are present. Select the NMS-free branch before export
+            # and fusion; nms=False below preserves that selection in the exporter.
+            model.model.end2end = True
+            if not model.model.end2end:
+                raise ValueError("Could not enable the checkpoint's NMS-free detection head")
             print(f"Building FP16 TensorRT engine: {width}x{height}, batch 1. This can take several minutes.", flush=True)
             exported = Path(model.export(
                 format="engine", device=gpu, imgsz=(height, width), batch=1,

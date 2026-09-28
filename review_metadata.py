@@ -1,11 +1,11 @@
 """Draft prediction metadata shared by the live collector, labeler, and generator."""
 
 import json
-import os
-import tempfile
 from pathlib import Path
 
 from PIL import Image
+
+from dataset_utils import (atomic_write)
 
 
 SCHEMA_VERSION = 1
@@ -47,13 +47,4 @@ def load_review_metadata(image_path: Path) -> dict | None:
 
 
 def save_review_metadata(image_path: Path, data: dict) -> None:
-    path = metadata_path(image_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(data, output, indent=2)
-            output.write("\n")
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    atomic_write(metadata_path(image_path), json.dumps(data, indent=2) + "\n")

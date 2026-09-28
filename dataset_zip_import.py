@@ -13,8 +13,9 @@ from typing import Callable
 import yaml
 from PIL import Image
 
+from dataset_utils import (IMAGE_SUFFIXES, parse_yolo_labels, normalize_names)
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 IGNORED_SOURCE_FOLDERS = {"versions", ".trash", ".invalid-labels", ".imports", "__macosx"}
 MAX_IMAGE_BYTES = 150 * 1024 * 1024
 MAX_SIDECAR_BYTES = 4 * 1024 * 1024
@@ -100,13 +101,7 @@ def _source_class_names(archive: zipfile.ZipFile, entries: dict,
                          else None)
             else:
                 names = data.get("names")
-                if isinstance(names, dict):
-                    try:
-                        names = [value for _, value in sorted(names.items(), key=lambda pair: int(pair[0]))]
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(f"Invalid class IDs in {entry[1].filename}") from exc
-            if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-                raise ValueError(f"Invalid class names in {entry[1].filename}")
+            names = normalize_names(names)
             cache[metadata_key] = names
             return names
     return None
@@ -114,34 +109,16 @@ def _source_class_names(archive: zipfile.ZipFile, entries: dict,
 
 def _convert_label(content: bytes, source_names: list[str] | None,
                    target_names: list[str]) -> bytes:
+    text = content.decode("utf-8-sig")
+    rows = parse_yolo_labels(text, len(source_names) if source_names is not None else len(target_names))
     target_ids = {name.casefold(): index for index, name in enumerate(target_names)}
     lines = []
-    for line_number, line in enumerate(content.decode("utf-8-sig").splitlines(), 1):
-        parts = line.split()
-        if not parts:
-            continue
-        if len(parts) != 5:
-            raise ValueError(f"Label line {line_number}: expected a class and four coordinates")
-        try:
-            class_id = int(parts[0])
-            cx, cy, width, height = (float(value) for value in parts[1:])
-        except ValueError as exc:
-            raise ValueError(f"Label line {line_number}: invalid number") from exc
-        if (class_id < 0 or not all(math.isfinite(value) for value in (cx, cy, width, height)) or
-                not (0 <= cx <= 1 and 0 <= cy <= 1 and width > 0 and height > 0 and
-                     0 <= cx - width / 2 < cx + width / 2 <= 1 and
-                     0 <= cy - height / 2 < cy + height / 2 <= 1)):
-            raise ValueError(f"Label line {line_number}: class or box coordinates out of range")
-        if source_names is None:
-            if class_id >= len(target_names):
-                raise ValueError(f"Label line {line_number}: class {class_id} is not in this dataset")
-            mapped_id = class_id
-        else:
-            if class_id >= len(source_names):
-                raise ValueError(f"Label line {line_number}: class {class_id} is missing from source metadata")
-            mapped_id = target_ids.get(source_names[class_id].casefold())
-            if mapped_id is None:
-                raise ValueError(f"Label line {line_number}: class {source_names[class_id]!r} is not in this dataset")
+    # Retain the original coordinate text/precision while remapping classes.
+    original_lines = (line.split() for line in text.splitlines() if line.strip())
+    for (class_id, *_coords), parts in zip(rows, original_lines):
+        mapped_id = class_id if source_names is None else target_ids.get(source_names[class_id].casefold())
+        if mapped_id is None:
+            raise ValueError(f"Class {source_names[class_id]!r} is not in this dataset")
         lines.append(f"{mapped_id} {' '.join(parts[1:])}")
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 

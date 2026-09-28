@@ -1,11 +1,14 @@
 """Press X to capture numbered, unlabeled training images. Press Ctrl+C to stop."""
 
+from inference_collection import next_image_number, save_candidate
 import time
 from pathlib import Path
 
 import cv2
 import dxcam
 import win32api
+
+from dataset_utils import (image_files as iter_image_files)
 
 
 # Settings
@@ -18,14 +21,11 @@ OUTPUT_INDEX = 0  # Primary monitor on the selected graphics device.
 POLL_INTERVAL_SECONDS = 0.01
 
 X_KEY = ord("X")
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 SPLITS = ("train", "valid", "test", "labeled")
 
 
 def image_files(folder: Path):
-    if not folder.is_dir():
-        raise FileNotFoundError(f"Image folder not found: {folder}")
-    return (path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    return iter_image_files(folder, missing_ok=False)
 
 
 def main() -> None:
@@ -37,13 +37,8 @@ def main() -> None:
 
     output_dir = dataset_dir / OUTPUT_DIR_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
-    used_numbers = {
-        int(path.stem)
-        for path in (*source_images, *image_files(output_dir))
-        if path.stem.isdecimal()
-    }
-    while next_number in used_numbers:
-        next_number += 1
+    next_number, used_numbers = next_image_number(
+        [*source_images, *image_files(output_dir)], start_at=next_number)
 
     print(f"Found {len(source_images)} images across train, valid, test, and labeled.")
     print(f"Press X to save {next_number}.jpg in {output_dir}. Press Ctrl+C to stop.")
@@ -59,27 +54,10 @@ def main() -> None:
                     print("No frame available; press X again.")
                 else:
                     resized = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
-                    encoded_ok, encoded = cv2.imencode(
-                        ".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-                    )
-                    if not encoded_ok:
-                        raise RuntimeError("Could not encode the screenshot as JPEG")
-
-                    while True:
-                        while next_number in used_numbers:
-                            next_number += 1
-                        image_path = output_dir / f"{next_number}.jpg"
-                        try:
-                            with image_path.open("xb") as image_file:
-                                image_file.write(encoded.tobytes())
-                            break
-                        except FileExistsError:
-                            used_numbers.add(next_number)
-                            next_number += 1
-
+                    image_path, next_number = save_candidate(
+                        output_dir, resized, None, next_number, used_numbers,
+                        jpeg_quality=JPEG_QUALITY, check_folders=False)
                     print(f"Saved {image_path}")
-                    used_numbers.add(next_number)
-                    next_number += 1
             was_down = is_down
             time.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:

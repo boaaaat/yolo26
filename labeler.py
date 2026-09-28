@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from dataset_generator import GenerateConfig, _read_boxes, generate_dataset, get_split_percentages
+from dataset_generator import GenerateConfig, generate_dataset, get_split_percentages
 from dataset_browser import DatasetBrowserDialog
 from dataset_project import (
     DEFAULT_COLORS, DatasetProject, find_dataset_root, load_project,
@@ -50,6 +50,12 @@ from PySide6.QtWidgets import (
 )
 from ultralytics import YOLO, YOLOE
 
+from dataset_utils import (
+    label_class_ids, class_name_map, IMAGE_SUFFIXES,
+    read_yolo_labels, parse_yolo_labels, atomic_write,
+    normalized_predictions,
+)
+
 
 # Settings: edit these paths and confidence values for your dataset.
 DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "rivals"
@@ -71,7 +77,6 @@ YOLOE_CONFIDENCE_BY_CLASS = {
 MODEL_IMAGE_SIZE = 1024
 DEVICE = 0  # First NVIDIA GPU; use "cpu" if needed.
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MIN_BOX_SIZE = 3.0
 
 
@@ -120,28 +125,10 @@ class Box:
 
 
 def read_labels(label_path: Path, width: int, height: int, class_count: int) -> list[Box]:
-    if not label_path.exists():
-        return []
-    boxes = []
-    for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        parts = line.split()
-        if len(parts) != 5:
-            raise ValueError(f"{label_path.name}, line {line_number}: expected five values")
-        try:
-            class_id = int(parts[0])
-            cx, cy, w, h = (float(value) for value in parts[1:])
-        except ValueError as exc:
-            raise ValueError(f"{label_path.name}, line {line_number}: invalid number") from exc
-        if not 0 <= class_id < class_count or not all(0 <= value <= 1 for value in (cx, cy, w, h)):
-            raise ValueError(f"{label_path.name}, line {line_number}: class or coordinates out of range")
-        x1, y1 = (cx - w / 2) * width, (cy - h / 2) * height
-        x2, y2 = (cx + w / 2) * width, (cy + h / 2) * height
-        if w <= 0 or h <= 0 or x1 < -0.01 or y1 < -0.01 or x2 > width + 0.01 or y2 > height + 0.01:
-            raise ValueError(f"{label_path.name}, line {line_number}: invalid box")
-        boxes.append(Box(class_id, max(0, x1), max(0, y1), min(width, x2), min(height, y2)))
-    return boxes
+    return [Box(cls, max(0, (cx-w/2)*width), max(0, (cy-h/2)*height),
+                min(width, (cx+w/2)*width), min(height, (cy+h/2)*height))
+            for cls,cx,cy,w,h in read_yolo_labels(label_path, class_count,
+                missing_ok=True, tolerance=(0.01/width, 0.01/height))]
 
 
 def accepted_signature(boxes: list[Box]) -> tuple:
@@ -482,7 +469,7 @@ class SuggestionWorker(QObject):
                 self.models[source] = (stamp, model)
             model = self.models[source][1]
             model_names = model.names
-            model_names = dict(model_names.items()) if isinstance(model_names, dict) else dict(enumerate(model_names))
+            model_names = class_name_map(model_names)
             if not set(model_names.values()).issubset(self.class_names):
                 raise ValueError(f"Model classes {model_names} are not in dataset classes {self.class_names}")
             thresholds = YOLOE_CONFIDENCE_BY_CLASS if source == "yoloe" else SUGGESTION_CONFIDENCE_BY_CLASS
@@ -498,15 +485,12 @@ class SuggestionWorker(QObject):
                 verbose=False,
             )[0]
             suggestions = []
-            if result.boxes is not None:
-                for predicted in result.boxes:
-                    model_class_id = int(predicted.cls.item())
-                    class_name = model_names[model_class_id]
-                    confidence = float(predicted.conf.item())
-                    if confidence < thresholds.get(class_name, default_threshold):
-                        continue
-                    dataset_class_id = self.class_names.index(class_name)
-                    suggestions.append((dataset_class_id, *predicted.xywhn[0].tolist(), confidence))
+            dataset_ids = {name: index for index, name in enumerate(self.class_names)}
+            for model_class_id, cx, cy, width, height, confidence in normalized_predictions(result):
+                class_name = model_names[model_class_id]
+                if confidence < thresholds.get(class_name, default_threshold):
+                    continue
+                suggestions.append((dataset_ids[class_name], cx, cy, width, height, confidence))
             self.finished.emit(image_path, suggestions)
         except Exception as exc:
             self.failed.emit(image_path, str(exc))
@@ -1337,16 +1321,7 @@ class LabelerWindow(QMainWindow):
         dialog.exec()
 
     def label_class_ids(self, image_path: Path) -> frozenset[int]:
-        label_path = self.label_path(image_path)
-        if not label_path.is_file():
-            return frozenset()
-        try:
-            return frozenset(
-                int(parts[0]) for line in label_path.read_text(encoding="utf-8").splitlines()
-                if (parts := line.split()) and parts[0].isdecimal()
-            )
-        except OSError:
-            return frozenset()
+        return label_class_ids(self.label_path(image_path), decimal_only=True)
 
     def open_unlabeled(self) -> None:
         self.switch_folder(self.dataset_dir / "unlabeled", dataset_root=self.dataset_dir)
@@ -1918,17 +1893,13 @@ class LabelerWindow(QMainWindow):
             bh = (box.y2 - box.y1) / height
             lines.append(f"{box.class_id} {cx:.10f} {cy:.10f} {bw:.10f} {bh:.10f}")
         label_path = self.label_path(self.current_path)
-        temp_path = label_path.with_suffix(".txt.tmp")
         try:
-            label_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-            _read_boxes(temp_path, len(self.class_names))
-            os.replace(temp_path, label_path)
+            content = "\n".join(lines) + ("\n" if lines else "")
+            parse_yolo_labels(content, len(self.class_names), source=label_path)
+            atomic_write(label_path, content)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return False
-        finally:
-            temp_path.unlink(missing_ok=True)
         self.saved_signature = signature
         self._update_queue_status()
         self.statusBar().showMessage(f"Saved {label_path.name}")
