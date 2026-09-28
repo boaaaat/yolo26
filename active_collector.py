@@ -17,7 +17,7 @@ from calibrate import make_dpi_aware
 from dataset_project import load_project
 from inference_overlay import DetectionOverlay, OVERLAY_FPS
 
-from dataset_utils import (class_name_map, prediction_rows)
+from dataset_utils import prediction_rows
 
 
 # Settings
@@ -27,6 +27,12 @@ DEVICE_INDEX = 0
 OUTPUT_INDEX = 0  # Primary monitor on the selected graphics device.
 DEVICE = 0
 IMAGE_SIZE = 1024
+PRECISION = "bf16"
+COMPILE_MODE = "reduce-overhead"
+WARMUP_PASSES = 3
+COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
+PREDICT_NMS = False  # Use YOLO26's NMS-free head, matching inference_bot.py.
+MAX_DETECTIONS = 100
 VIDEO_FPS = 20
 JPEG_QUALITY = 95
 INFERENCE_FPS = 1  # Review sampling rate; live overlay predictions target OVERLAY_FPS.
@@ -110,7 +116,7 @@ def record_video(camera, ffmpeg_path: str, video_path: Path, stop_event: threadi
 def main() -> None:
     import dxcam
     import torch
-    from ultralytics import YOLO
+    from inference_runtime import InferenceConfig, InferenceRuntime
     cv2.setNumThreads(OPENCV_THREADS)
     torch.set_num_threads(TORCH_CPU_THREADS)
     if INFERENCE_FPS <= 0 or VIDEO_FPS <= 0 or MAX_SAVES_PER_SESSION <= 0 or MIN_SECONDS_BETWEEN_SAVES < 0:
@@ -127,13 +133,23 @@ def main() -> None:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     project = load_project(dataset_dir)
-    model = YOLO(str(checkpoint))
-    if model.task != "detect":
-        raise ValueError("The checkpoint must be an object detection model")
-    model_names = model.names
-    model_names = class_name_map(model_names)
+    if MAX_DETECTIONS <= 0:
+        raise ValueError("MAX_DETECTIONS must be positive")
+    runtime = InferenceRuntime(InferenceConfig(
+        checkpoint=checkpoint,
+        gpu_index=DEVICE,
+        image_size=IMAGE_SIZE,
+        precision=PRECISION,
+        compile_mode=COMPILE_MODE,
+        warmup_passes=WARMUP_PASSES,
+        cache_dir=COMPILE_CACHE_DIR,
+        nms=PREDICT_NMS,
+    ))
+    model_names = runtime.names
     if not set(model_names.values()).issubset(project.names):
         raise ValueError(f"Checkpoint classes {model_names} do not match dataset classes {project.names}")
+    # Compile before recording starts so compilation never stalls a live session.
+    runtime.warmup(confidence=PREDICTION_CONFIDENCE, max_detections=MAX_DETECTIONS)
 
     writer = SampleWriter(checkpoint, model_names, collection_options())
     output_dir = writer.output_dir
@@ -257,8 +273,7 @@ def main() -> None:
             confidence = PREDICTION_CONFIDENCE if sample_due else OVERLAY_CONFIDENCE
             if overlay is not None:
                 confidence = min(confidence, OVERLAY_CONFIDENCE)
-            result = model.predict(source=frame, conf=confidence,
-                                   imgsz=IMAGE_SIZE, device=DEVICE, verbose=False)[0]
+            result = runtime.predict(frame, confidence=confidence, max_detections=MAX_DETECTIONS)
             rows = prediction_rows(result)
             if overlay is not None:
                 fresh = time.perf_counter() - frame_time <= OVERLAY_MAX_AGE_SECONDS

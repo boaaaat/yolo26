@@ -6,26 +6,17 @@ Press = to arm, - to pause, and Ctrl+C to exit. Settings are below.
 from types import SimpleNamespace
 from inference_controls import (ControlOptions, AimState, BoxCoords, high_resolution_timer,
                                 wait_until, watch_hotkeys, aim_loop, load_locked_center)
-import hashlib
-import importlib.metadata
-import importlib.util
-import json
-import sys
 import threading
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import dxcam
-import numpy as np
-import torch
 import win32api
 import win32con
-from ultralytics import YOLO
 
 from calibrate import make_dpi_aware
+from inference_runtime import InferenceConfig, InferenceRuntime
 
-from dataset_utils import (atomic_write)
 
 
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "runs" / "yolo26n" / "weights" / "best.pt"
@@ -110,81 +101,15 @@ def inference_options(**overrides):
     return SimpleNamespace(**values)
 
 
-def native_bf16_supported() -> bool:
-    try:
-        return torch.cuda.is_bf16_supported(including_emulation=False)
-    except TypeError:
-        return torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability()[0] >= 8
-
-
-def compiled_cache_path(checkpoint: Path, *, options) -> Path:
-    with checkpoint.open("rb") as source:
-        checkpoint_hash = hashlib.file_digest(source, "sha256").hexdigest()
-    try:
-        triton_version = importlib.metadata.version("triton-windows")
-    except importlib.metadata.PackageNotFoundError:
-        triton_version = importlib.metadata.version("triton")
-    identity = {
-        "checkpoint_sha256": checkpoint_hash,
-        "image_size": options.IMAGE_SIZE,
-        "compile_mode": options.COMPILE_MODE,
-        "dtype": options.PRECISION,
-        "torch": torch.__version__,
-        "triton": triton_version,
-        "ultralytics": importlib.metadata.version("ultralytics"),
-        "cuda": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(options.GPU_INDEX),
-        "gpu_capability": torch.cuda.get_device_capability(options.GPU_INDEX),
-        "python": sys.version_info[:3],
-    }
-    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:24]
-    return options.COMPILE_CACHE_DIR / f"model-{key}.ptcache"
-
-
-def load_compiled_cache(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        if torch.compiler.load_cache_artifacts(path.read_bytes()) is None:
-            raise ValueError("cache contains no compiler artifacts")
-    except Exception as exc:
-        print(f"Could not load compiled cache ({exc}); rebuilding it.")
-        return False
-    print(f"Loaded compiled artifacts from {path}")
-    return True
-
-
-def save_compiled_cache(path: Path) -> None:
-    try:
-        artifacts = torch.compiler.save_cache_artifacts()
-        if artifacts is None:
-            print("PyTorch did not return compiler artifacts to save.")
-            return
-        atomic_write(path, artifacts[0])
-        print(f"Saved compiled artifacts to {path}")
-    except Exception as exc:
-        print(f"Could not save compiled cache ({exc}); inference can still run.")
-
-
-def predict(model: YOLO, frame: np.ndarray, enemy_class_id: int,
+def predict(runtime: InferenceRuntime, frame, enemy_class_id: int,
             collection_confidence: float | None = None, *, options):
-    precision_context = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                         if options.PRECISION == "bf16" else nullcontext())
-    with torch.inference_mode(), precision_context:
-        return model.predict(
-            source=frame,
-            device=options.GPU_INDEX,
-            imgsz=options.IMAGE_SIZE,
-            rect=False,
-            conf=min(options.CONFIDENCE, collection_confidence) if collection_confidence is not None else options.CONFIDENCE,
-            classes=None if collection_confidence is not None or options.draw_boxes_overlay else [enemy_class_id],
-            max_det=(options.COLLECT_MAX_DETECTIONS if collection_confidence is not None
-                     else 100 if options.draw_boxes_overlay else 20),
-            nms=options.PREDICT_NMS,
-            compile=options.COMPILE_MODE,
-            quantize=32,
-            verbose=False,
-        )[0]
+    return runtime.predict(
+        frame,
+        confidence=min(options.CONFIDENCE, collection_confidence) if collection_confidence is not None else options.CONFIDENCE,
+        classes=None if collection_confidence is not None or options.draw_boxes_overlay else [enemy_class_id],
+        max_detections=(options.COLLECT_MAX_DETECTIONS if collection_confidence is not None
+                        else 100 if options.draw_boxes_overlay else 20),
+    )
 
 
 def enemy_boxes(result) -> tuple[BoxCoords, ...]:
@@ -211,44 +136,21 @@ def main(options=None) -> None:
         raise ValueError("FPS, aim, confidence, or shooting settings are invalid")
     make_dpi_aware()
     locked_center = load_locked_center()
-    checkpoint = options.CHECKPOINT_PATH.expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA-enabled PyTorch installation and NVIDIA GPU are required")
-    torch.cuda.set_device(options.GPU_INDEX)
-    capability = torch.cuda.get_device_capability(options.GPU_INDEX)
-    supported_arches = torch.cuda.get_arch_list()
-    if capability[0] == 6 and supported_arches and not any(
-        arch.startswith("sm_") and arch[3:].isdigit()
-        and int(arch[3:]) // 10 == capability[0]
-        and int(arch[3:]) % 10 <= capability[1]
-        for arch in supported_arches
-    ):
-        raise RuntimeError(
-            f"This PyTorch CUDA build does not include Pascal support (GPU sm_{capability[0]}{capability[1]}). "
-            "Install a PyTorch CUDA 12.6 build in this environment; CUDA 13 builds omit Pascal."
-        )
-    if options.PRECISION == "bf16" and not native_bf16_supported():
-        raise RuntimeError("This GPU or PyTorch build does not support native CUDA BF16")
-    if options.COMPILE_MODE and importlib.util.find_spec("triton") is None:
-        raise RuntimeError(
-            'Native Windows torch.compile needs Triton. In the yolo environment, run '
-            'python -m pip install "triton-windows>=3.8,<3.9" for PyTorch 2.14.'
-        )
-    torch.backends.cudnn.benchmark = True  # Fixed image shape lets cuDNN choose fast kernels.
-    torch.set_float32_matmul_precision("high" if options.PRECISION == "bf16" else "highest")
-
-    model = YOLO(str(checkpoint))
-    if model.task != "detect":
-        raise ValueError(f"Expected a detection checkpoint, got {model.task!r}")
-    names = dict(model.names.items()) if isinstance(model.names, dict) else dict(enumerate(model.names))
+    runtime = InferenceRuntime(InferenceConfig(
+        checkpoint=options.CHECKPOINT_PATH,
+        gpu_index=options.GPU_INDEX,
+        image_size=options.IMAGE_SIZE,
+        precision=options.PRECISION,
+        compile_mode=options.COMPILE_MODE,
+        warmup_passes=options.WARMUP_PASSES,
+        cache_dir=options.COMPILE_CACHE_DIR,
+        nms=options.PREDICT_NMS,
+    ))
+    checkpoint = runtime.checkpoint
+    names = runtime.names
     enemy_ids = [class_id for class_id, name in names.items() if name.casefold() == options.ENEMY_CLASS_NAME.casefold()]
     if len(enemy_ids) != 1:
         raise ValueError(f"Expected one {options.ENEMY_CLASS_NAME!r} class in checkpoint: {names}")
-    cache_path = compiled_cache_path(checkpoint, options=options) if options.COMPILE_MODE else None
-    cache_loaded = load_compiled_cache(cache_path) if cache_path is not None else False
-
     camera = dxcam.create(device_idx=options.DXCAM_DEVICE_INDEX, output_idx=options.DXCAM_OUTPUT_INDEX,
                           output_color="BGR")
     overlay = None
@@ -261,20 +163,12 @@ def main(options=None) -> None:
         primary_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
         if (screen_width, screen_height) != (primary_width, primary_height):
             raise ValueError("Selected DXcam output is not the primary display; adjust the output index")
-        black_frame = np.zeros_like(full_frame)
-        action = ("Using cached compiler artifacts and warming" if cache_loaded else
-                  "Compiling and warming" if options.COMPILE_MODE else "Warming")
-        print(f"{action} {checkpoint.name} on {torch.cuda.get_device_name(options.GPU_INDEX)}...")
-        for _ in range(options.WARMUP_PASSES):
-            predict(model, black_frame, enemy_ids[0], options=options)
-        torch.cuda.synchronize(options.GPU_INDEX)
-        if options.COMPILE_MODE and getattr(model.predictor.model, "_orig_mod", None) is None:
-            raise RuntimeError("PyTorch compilation was unavailable; Ultralytics fell back to eager inference")
-        if cache_path is not None and not cache_loaded:
-            save_compiled_cache(cache_path)
-        compile_description = "compiled" if options.COMPILE_MODE else "eager"
-        print(f"Ready: {options.PRECISION.upper()} + {compile_description} model, "
-              f"{options.IMAGE_SIZE}px input, {options.INFERENCE_TARGET_FPS} FPS target.")
+        runtime.warmup(
+            frame_shape=full_frame.shape[:2], confidence=options.CONFIDENCE,
+            classes=None if options.draw_boxes_overlay else [enemy_ids[0]],
+            max_detections=100 if options.draw_boxes_overlay else 20,
+        )
+        print(f"Inference target: {options.INFERENCE_TARGET_FPS} FPS.")
         print(f"Press = to arm, - to pause, Ctrl+C to exit. Auto shoot: {options.AUTO_SHOOT}; instant mouse: {options.instant_mouse}")
 
         if options.draw_boxes_overlay:
@@ -330,7 +224,7 @@ def main(options=None) -> None:
                         if options.REPORT_STAGE_TIMES:
                             stage_ms["capture"] += (time.perf_counter_ns() - capture_start) / 1_000_000
                         sample_due = collector is not None and collector.due(time.perf_counter_ns())
-                        result = predict(model, frame, enemy_ids[0],
+                        result = predict(runtime, frame, enemy_ids[0],
                                          collector.prediction_confidence if sample_due else None, options=options)
                         if sample_due or overlay is not None:
                             rows = (tuple(tuple(row) for row in result.boxes.data.detach().cpu().tolist())
