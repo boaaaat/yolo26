@@ -1278,6 +1278,7 @@ class LabelerWindow(QMainWindow):
         self.queue_filter.addItem("All images", "all")
         self.queue_filter.addItem("Needs labels", "needs_labels")
         self.queue_filter.addItem("Has labels", "has_labels")
+        self.queue_filter.addItem("Negative images", "negative")
         self.queue_filter.insertSeparator(self.queue_filter.count())
         for class_id, name in enumerate(self.class_names):
             self.queue_filter.addItem(f"Class: {name}", f"class:{class_id}")
@@ -1328,6 +1329,14 @@ class LabelerWindow(QMainWindow):
 
     def label_class_ids(self, image_path: Path) -> frozenset[int]:
         return label_class_ids(self.label_path(image_path), decimal_only=True)
+
+    def is_negative_image(self, image_path: Path) -> bool:
+        if self.image_class_ids.get(image_path):
+            return False
+        try:
+            return not self.label_path(image_path).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return False
 
     def open_unlabeled(self) -> None:
         self.switch_folder(self.dataset_dir / "unlabeled", dataset_root=self.dataset_dir)
@@ -1673,7 +1682,7 @@ class LabelerWindow(QMainWindow):
     def on_queue_filter_changed(self, *_args) -> None:
         requested = self.queue_filter.currentData()
         previous = self._last_filter_data
-        if isinstance(requested, str) and requested.startswith("class:") and (
+        if isinstance(requested, str) and (requested == "negative" or requested.startswith("class:")) and (
             self.source_dir != self.dataset_dir / "labeled" / "images"
         ):
             self.switch_folder(self.dataset_dir / "labeled", dataset_root=self.dataset_dir,
@@ -1727,6 +1736,8 @@ class LabelerWindow(QMainWindow):
                 visible = visible and not saved
             elif filter_mode == "has_labels":
                 visible = visible and saved
+            elif filter_mode == "negative":
+                visible = visible and saved and self.is_negative_image(path)
             elif class_id is not None:
                 visible = visible and saved and class_id in self.image_class_ids.get(path, frozenset())
             item.setHidden(not visible)
@@ -1749,7 +1760,8 @@ class LabelerWindow(QMainWindow):
             item.setForeground(QBrush(QColor("#56d6a5" if saved else "#e5eaf3")))
         self.queue_count.setText(f"{self.image_list.count()} images · {saved_count} labeled")
         self.apply_filter()
-        if isinstance(self.queue_filter.currentData(), str) and self.queue_filter.currentData().startswith("class:"):
+        filter_mode = self.queue_filter.currentData()
+        if isinstance(filter_mode, str) and (filter_mode == "negative" or filter_mode.startswith("class:")):
             QTimer.singleShot(0, self._select_visible_queue_item)
 
     def on_image_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
