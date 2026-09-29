@@ -10,10 +10,11 @@ from training_dashboard import attach_dashboard
 # Use the latest generated version in the most recently opened dataset.
 # Set a specific version path here to train that version instead.
 DATASET_PATH = None
-MODEL = "yolo26m.pt"  # Pretrained medium model used for a new run.
+# MODEL = "yolo26m.pt"  # Pretrained medium model used for a new run.
+MODEL = r"C:\Users\Abhil\Desktop\yolo26\runs\yolo26m\weights\best.pt"
 
 # EPOCHS = 250  # Total for "new"; additional epochs for "continue".
-EPOCHS = 200
+EPOCHS = 50
 
 IMAGE_SIZE = 1024
 BATCH_SIZE = 4
@@ -23,8 +24,8 @@ RUNS_DIR = Path(__file__).resolve().parent / "runs"
 RUN_NAME = "yolo26m"
 TRAIN_MODE = "new"  # "new", "resume" an interrupted run, or "continue" a completed run.
 
-# CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "last.pt"
-CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "best.pt"
+RESUME_CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "last.pt"
+CONTINUE_CHECKPOINT_PATH = RUNS_DIR / RUN_NAME / "weights" / "best.pt"
 CONTINUE_RUN_NAME = f"{RUN_NAME}_continue"
 OPEN_DASHBOARD = True  # Open a live browser dashboard; a PNG is also saved in the run folder.
 
@@ -59,7 +60,8 @@ def main() -> None:
     if TRAIN_MODE == "new":
         model = YOLO(MODEL)
     else:
-        checkpoint = Path(CHECKPOINT_PATH).expanduser().resolve()
+        checkpoint_path = RESUME_CHECKPOINT_PATH if TRAIN_MODE == "resume" else CONTINUE_CHECKPOINT_PATH
+        checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Training checkpoint not found: {checkpoint}")
         model = YOLO(str(checkpoint))

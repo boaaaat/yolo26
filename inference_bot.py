@@ -35,7 +35,7 @@ WARMUP_PASSES = 3
 COMPILE_CACHE_DIR = Path(__file__).resolve().parent / ".inference_compile_cache"
 
 AUTO_SHOOT = True
-collect_data = True  # Reuse live detections; save useful frames on a background thread.
+collect_data = False  # Reuse live detections; save useful frames on a background thread.
 draw_boxes_overlay = True  # Draw live boxes for every class over the primary display.
 COLLECT_MAX_DETECTIONS = 100
 instant_mouse = False  # Move to the aim point in one mouse event when enabled.

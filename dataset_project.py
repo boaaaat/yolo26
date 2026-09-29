@@ -83,6 +83,7 @@ class DatasetProject:
     last_image: str | None = None
     active_class: int = 0
     generator_settings: dict | None = None
+    confirm_image_delete: bool = True
 
     @property
     def names(self) -> list[str]:
@@ -104,6 +105,7 @@ class DatasetProject:
             "last_image": self.last_image,
             "active_class": self.active_class,
             "generator_settings": self.generator_settings,
+            "confirm_image_delete": self.confirm_image_delete,
         }, sort_keys=False)
 
     def save_state(self) -> None:
@@ -145,6 +147,7 @@ def load_project(root: Path) -> DatasetProject:
         project = DatasetProject(
             root, classes, data.get("last_folder"), data.get("last_image"),
             int(data.get("active_class", 0)), data.get("generator_settings"),
+            data.get("confirm_image_delete", True) is not False,
         )
         names_in_yaml = _names_from_data(root / "data.yaml")
         if names_in_yaml != project.names:

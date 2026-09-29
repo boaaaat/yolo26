@@ -21,6 +21,8 @@ from PySide6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QPainter
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
@@ -41,11 +44,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QSpinBox,
     QSplitter,
     QSlider,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -177,6 +182,7 @@ class LabelCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QBrush(QColor("#111827")))
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.class_names = class_names
@@ -336,6 +342,7 @@ class LabelCanvas(QGraphicsView):
         return -1, None
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus()
         if event.button() == Qt.MouseButton.MiddleButton:
             self.pan_position = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -1070,10 +1077,30 @@ class LabelerWindow(QMainWindow):
 
     def _button(self, text: str, callback, *, prominent: bool = False) -> QPushButton:
         button = QPushButton(text)
+        button.installEventFilter(self)
         button.clicked.connect(callback)
         if prominent:
             button.setObjectName("primaryButton")
         return button
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (isinstance(watched, QAbstractButton)
+                and event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                and event.key() == Qt.Key.Key_Space):
+            if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                self.canvas_fit_later()
+            return True
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _button_grid() -> QGridLayout:
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        return grid
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Labeler · YOLO26")
@@ -1150,16 +1177,19 @@ class LabelerWindow(QMainWindow):
         self.folder_label.setObjectName("muted")
         self.folder_label.setWordWrap(True)
         left_layout.addWidget(self.folder_label)
-        left_layout.addWidget(self._button("Open dataset…", self.open_dataset))
-        left_layout.addWidget(self._button("Open unlabeled", self.open_unlabeled))
-        left_layout.addWidget(self._button("Open labeled", self.open_labeled))
-        self.finish_all_button = self._button("Move finished to Labeled", self.finish_all)
+        dataset_actions = self._button_grid()
+        dataset_actions.addWidget(self._button("Open dataset…", self.open_dataset), 0, 0)
+        dataset_actions.addWidget(self._button("Open unlabeled", self.open_unlabeled), 0, 1)
+        dataset_actions.addWidget(self._button("Open labeled", self.open_labeled), 1, 0)
+        self.finish_all_button = self._button("Move finished", self.finish_all)
         self.finish_all_button.setToolTip("Move images with saved labels, including negatives. Leave unlabeled images and pending suggestions in the queue.")
-        left_layout.addWidget(self.finish_all_button)
-        left_layout.addWidget(self._button("Browse dataset splits…", self.browse_dataset))
+        dataset_actions.addWidget(self.finish_all_button, 1, 1)
+        dataset_actions.addWidget(self._button("Browse splits…", self.browse_dataset), 2, 0)
         self.import_button = self._button("Import ZIP…", self.import_zip)
-        left_layout.addWidget(self.import_button)
-        left_layout.addWidget(self._button("Generate dataset…", self.open_generator))
+        dataset_actions.addWidget(self.import_button, 2, 1)
+        generate_button = self._button("Generate dataset…", self.open_generator)
+        dataset_actions.addWidget(generate_button, 3, 0, 1, 2)
+        left_layout.addLayout(dataset_actions)
         self.queue_count = QLabel()
         self.queue_count.setObjectName("muted")
         left_layout.addWidget(self.queue_count)
@@ -1172,8 +1202,20 @@ class LabelerWindow(QMainWindow):
         self._last_filter_data = "all"
         self.queue_filter.currentIndexChanged.connect(self.on_queue_filter_changed)
         left_layout.addWidget(self.queue_filter)
-        left_layout.addWidget(self._button("Refresh queue", self.refresh_queue_from_button))
-        left_layout.addWidget(self._button("Delete image…  Shift+Del", self.delete_current_image))
+        queue_actions = self._button_grid()
+        queue_actions.addWidget(self._button("Refresh queue", self.refresh_queue_from_button), 0, 0)
+        delete_image_button = self._button("Delete image", self.delete_current_image)
+        delete_image_button.setToolTip("Move the current image to dataset trash (Shift+Del)")
+        queue_actions.addWidget(delete_image_button, 0, 1)
+        left_layout.addLayout(queue_actions)
+        self.confirm_image_delete = QCheckBox("Ask before deleting images")
+        self.confirm_image_delete.setChecked(self.project.confirm_image_delete)
+        self.confirm_image_delete.setToolTip(
+            "When unchecked, Delete image and Shift+Del move images to dataset trash without a prompt."
+        )
+        self.confirm_image_delete.installEventFilter(self)
+        self.confirm_image_delete.toggled.connect(self._save_session)
+        left_layout.addWidget(self.confirm_image_delete)
         self.image_list = QListWidget()
         self.image_list.currentItemChanged.connect(self.on_image_selected)
         left_layout.addWidget(self.image_list, 1)
@@ -1211,7 +1253,7 @@ class LabelerWindow(QMainWindow):
         self._fill_class_list()
         self.class_list.setCurrentRow(0)
         self.class_list.currentRowChanged.connect(self.on_class_selected)
-        right_layout.addWidget(self.class_list)
+        right_layout.addWidget(self.class_list, 1)
         right_layout.addWidget(self._button("Manage classes…", self.manage_classes))
         class_hint = QLabel("Click a class to change the selected box, or choose the class for new boxes.")
         class_hint.setObjectName("muted")
@@ -1220,27 +1262,42 @@ class LabelerWindow(QMainWindow):
         right_layout.addWidget(QLabel("BOXES"))
         self.box_list = QListWidget()
         self.box_list.currentRowChanged.connect(self.on_box_selected)
-        right_layout.addWidget(self.box_list, 1)
+        right_layout.addWidget(self.box_list, 2)
         self.box_count = QLabel("0 accepted · 0 suggestions")
         self.box_count.setObjectName("muted")
         right_layout.addWidget(self.box_count)
-        right_layout.addWidget(self._button("Delete selected  Del", self.delete_selected))
-        right_layout.addWidget(self._button("Accept selected  Enter", self.accept_selected))
-        right_layout.addWidget(self._button("Accept all suggestions", self.accept_all))
-        right_layout.addWidget(self._button("Reject all suggestions", self.reject_all))
+        box_actions = self._button_grid()
+        delete_box_button = self._button("Delete selected", self.delete_selected)
+        delete_box_button.setToolTip("Delete the selected box (Del)")
+        box_actions.addWidget(delete_box_button, 0, 0)
+        accept_box_button = self._button("Accept selected", self.accept_selected)
+        accept_box_button.setToolTip("Accept the selected suggestion (Enter)")
+        box_actions.addWidget(accept_box_button, 0, 1)
+        accept_all_button = self._button("Accept all", self.accept_all)
+        accept_all_button.setToolTip("Accept all suggestions (A)")
+        box_actions.addWidget(accept_all_button, 1, 0)
+        reject_all_button = self._button("Reject all", self.reject_all)
+        reject_all_button.setToolTip("Reject all suggestions (R)")
+        box_actions.addWidget(reject_all_button, 1, 1)
         negative_button = self._button("Mark negative", self.mark_negative)
         negative_button.setToolTip(
-            "Clear all labels and suggestions, save an empty label file, and finish unlabeled images."
+            "Clear all labels and suggestions, save an empty label file, and finish unlabeled images (N)."
         )
-        right_layout.addWidget(negative_button)
+        box_actions.addWidget(negative_button, 2, 0, 1, 2)
+        right_layout.addLayout(box_actions)
         right_layout.addSpacing(12)
         right_layout.addWidget(QLabel("SUGGESTION MODEL"))
         self.suggestion_source = RunSelector(self.refresh_suggestion_models)
         self.refresh_suggestion_models()
         right_layout.addWidget(self.suggestion_source)
-        right_layout.addWidget(self._button("Refresh training runs", self.refresh_suggestion_models))
+        suggestion_actions = self._button_grid()
         self.suggest_button = self._button("Suggest boxes", self.suggest_boxes)
-        right_layout.addWidget(self.suggest_button)
+        self.suggest_button.setToolTip(
+            "Suggest boxes (S). Reject current suggestions and suggest again (G)."
+        )
+        suggestion_actions.addWidget(self.suggest_button, 0, 0)
+        suggestion_actions.addWidget(self._button("Refresh runs", self.refresh_suggestion_models), 0, 1)
+        right_layout.addLayout(suggestion_actions)
         checkpoint_hint = QLabel("Suggestions are dashed. Accept or delete them before finishing. Review every suggested box and class.")
         checkpoint_hint.setObjectName("muted")
         checkpoint_hint.setWordWrap(True)
@@ -1252,10 +1309,12 @@ class LabelerWindow(QMainWindow):
 
     def _build_shortcuts(self) -> None:
         bindings = {
-            "B": lambda: self.set_mode("draw"),
-            "V": lambda: self.set_mode("select"),
-            "Space": self.canvas_fit_later,
             "Ctrl+S": self.save_current,
+        }
+        for sequence, callback in bindings.items():
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+        focus_sensitive_bindings = {
             "Ctrl+Z": self.undo,
             "Ctrl+Y": self.redo,
             "Delete": self.delete_selected,
@@ -1263,13 +1322,34 @@ class LabelerWindow(QMainWindow):
             "Return": self.accept_selected,
             "Left": self.previous_image,
             "Right": self.next_image,
+            "Space": self.canvas_fit_later,
+            "B": lambda: self.set_mode("draw"),
+            "V": lambda: self.set_mode("select"),
+            "A": self.accept_all,
+            "R": self.reject_all,
+            "N": self.mark_negative,
+            "S": self.suggest_boxes,
+            "G": self.reject_and_suggest,
         }
-        for sequence, callback in bindings.items():
+        self.focus_sensitive_shortcuts = []
+        for sequence, callback in focus_sensitive_bindings.items():
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
+            self.focus_sensitive_shortcuts.append(shortcut)
         for index in range(9):
             shortcut = QShortcut(QKeySequence(str(index + 1)), self)
             shortcut.activated.connect(lambda index=index: self.class_list.setCurrentRow(index))
+            self.focus_sensitive_shortcuts.append(shortcut)
+        QApplication.instance().focusChanged.connect(self._update_focus_sensitive_shortcuts)
+        self._update_focus_sensitive_shortcuts(None, QApplication.focusWidget())
+
+    def _update_focus_sensitive_shortcuts(self, _old: QWidget | None, current: QWidget | None) -> None:
+        while current is not None:
+            if isinstance(current, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit, QComboBox)):
+                break
+            current = current.parentWidget()
+        for shortcut in self.focus_sensitive_shortcuts:
+            shortcut.setEnabled(current is None)
 
     def _fill_class_list(self) -> None:
         self.class_list.blockSignals(True)
@@ -1500,6 +1580,9 @@ class LabelerWindow(QMainWindow):
                 self.statusBar().showMessage(f"Could not remember dataset: {exc}")
             self.class_names[:] = project.names
             self.class_colors[:] = project.colors
+            self.confirm_image_delete.blockSignals(True)
+            self.confirm_image_delete.setChecked(project.confirm_image_delete)
+            self.confirm_image_delete.blockSignals(False)
             self._fill_class_list()
             self._fill_queue_filter()
             active = min(max(0, project.active_class), len(self.class_names) - 1)
@@ -1597,6 +1680,7 @@ class LabelerWindow(QMainWindow):
             self.project.last_folder = str(folder)
             self.project.last_image = self.current_path.name if self.current_path else None
             self.project.active_class = max(0, self.class_list.currentRow())
+            self.project.confirm_image_delete = self.confirm_image_delete.isChecked()
             self.project.save_state()
         except OSError as exc:
             self.statusBar().showMessage(f"Could not save labeler state: {exc}")
@@ -1681,14 +1765,15 @@ class LabelerWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot delete image", "The selected image is outside this dataset root.")
             return
         trash_root = self.dataset_dir / ".trash"
-        answer = QMessageBox.question(
-            self, "Delete image",
-            f"Move {image_path.name} and its associated files to the dataset trash?\n\n{trash_root}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        if self.confirm_image_delete.isChecked():
+            answer = QMessageBox.question(
+                self, "Delete image",
+                f"Move {image_path.name} and its associated files to the dataset trash?\n\n{trash_root}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         moved = []
         trash_dir = None
         try:
@@ -2222,6 +2307,12 @@ class LabelerWindow(QMainWindow):
         self.statusBar().showMessage(f"Marked {image_path.name} as negative · all labels and suggestions cleared")
 
     def suggest_boxes(self) -> None:
+        self._start_suggestions(replace_existing=False)
+
+    def reject_and_suggest(self) -> None:
+        self._start_suggestions(replace_existing=True)
+
+    def _start_suggestions(self, *, replace_existing: bool) -> None:
         if self.current_path is None or not self.suggest_button.isEnabled():
             return
         source = self.suggestion_source.currentData()
@@ -2234,6 +2325,8 @@ class LabelerWindow(QMainWindow):
             if not path.expanduser().resolve().is_file():
                 QMessageBox.warning(self, "Model file missing", f"Model file not found:\n{path}\nRefresh training runs to update the list.")
                 return
+        if replace_existing:
+            self.reject_all()
         if self.suggestion_thread is None:
             self.suggestion_thread = QThread(self)
             self.suggestion_worker = SuggestionWorker(self.class_names)
