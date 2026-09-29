@@ -519,17 +519,20 @@ class ZipImportWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, archive_path: Path, dataset_dir: Path, class_names: list[str]) -> None:
+    def __init__(self, archive_path: Path, dataset_dir: Path, class_names: list[str],
+                 review_labeled: bool) -> None:
         super().__init__()
         self.archive_path = archive_path
         self.dataset_dir = dataset_dir
         self.class_names = class_names.copy()
+        self.review_labeled = review_labeled
 
     @Slot()
     def run(self) -> None:
         try:
             result = import_dataset_zip(self.archive_path, self.dataset_dir, self.class_names,
-                                        lambda done, total: self.progress.emit(done, total))
+                                        lambda done, total: self.progress.emit(done, total),
+                                        review_labeled=self.review_labeled)
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
@@ -1389,6 +1392,18 @@ class LabelerWindow(QMainWindow):
         )
         if not selected:
             return
+        choice = QMessageBox(self)
+        choice.setWindowTitle("Review imported labels?")
+        choice.setText("Where should images with valid labels from this ZIP go?")
+        choice.setInformativeText("Images without valid labels will stay in Unlabeled for review.")
+        review_button = choice.addButton("Review in Unlabeled", QMessageBox.ButtonRole.AcceptRole)
+        labeled_button = choice.addButton("Send to Labeled", QMessageBox.ButtonRole.AcceptRole)
+        choice.addButton(QMessageBox.StandardButton.Cancel)
+        choice.setDefaultButton(review_button)
+        choice.exec()
+        if choice.clickedButton() not in (review_button, labeled_button):
+            return
+        review_labeled = choice.clickedButton() == review_button
         self.import_button.setEnabled(False)
         self.import_progress = QProgressDialog(self)
         self.import_progress.setWindowTitle("Importing dataset ZIP")
@@ -1400,7 +1415,8 @@ class LabelerWindow(QMainWindow):
         self.import_progress.setAutoReset(False)
         self.import_progress.setRange(0, 0)
         self.import_thread = QThread(self)
-        self.import_worker = ZipImportWorker(Path(selected), self.dataset_dir, self.class_names)
+        self.import_worker = ZipImportWorker(Path(selected), self.dataset_dir, self.class_names,
+                                             review_labeled)
         self.import_worker.moveToThread(self.import_thread)
         self.import_thread.started.connect(self.import_worker.run)
         self.import_worker.progress.connect(self.on_import_progress)

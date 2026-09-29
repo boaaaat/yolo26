@@ -155,7 +155,8 @@ def _convert_review(content: bytes, target_names: list[str]) -> tuple[bytes, lis
 
 
 def import_dataset_zip(archive_path: Path, dataset_dir: Path, class_names: list[str],
-                       progress: Callable[[int, int], None] | None = None) -> ImportResult:
+                       progress: Callable[[int, int], None] | None = None,
+                       *, review_labeled: bool = False) -> ImportResult:
     """Stage a ZIP import, then commit all renamed image groups together."""
     token = uuid.uuid4().hex[:12]
     labeled = unlabeled = collector_drafts = issues = skipped = assumed = 0
@@ -239,6 +240,9 @@ def import_dataset_zip(archive_path: Path, dataset_dir: Path, class_names: list[
                                 issue_messages.append(f"Could not read source issue note: {exc}")
                         elif backup_entry is not None:
                             issue_messages.append("Source had an invalid label saved for review")
+
+                if label_content is not None:
+                    destination = "unlabeled" if review_labeled else "labeled"
 
                 review_content = None
                 original_review = None
