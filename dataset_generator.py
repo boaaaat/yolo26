@@ -46,10 +46,6 @@ class CollectedImage:
     session_id: str | None
     include_in_version: bool
 
-    @property
-    def captured(self) -> bool:
-        return self.session_id is not None
-
 
 def _load_split_manifest(dataset_dir: Path) -> dict | None:
     manifest_path = dataset_dir / SPLIT_MANIFEST
@@ -87,95 +83,111 @@ def get_split_percentages(dataset_dir: Path) -> tuple[int, int] | None:
     return (int(manifest["train_percent"]), int(manifest["valid_percent"])) if manifest else None
 
 
-def _initial_split_assignments(images: list[CollectedImage], config: GenerateConfig) -> dict[str, dict]:
-    def visually_distinct_groups(candidates: list[CollectedImage]) -> list[list[CollectedImage]]:
-        parents = list(range(len(candidates)))
-        session_representatives: dict[str, int] = {}
+def _visually_distinct_groups(images: list[CollectedImage]) -> list[list[CollectedImage]]:
+    """Keep images from one capture session or a near-duplicate chain in one split."""
+    parents = list(range(len(images)))
+    session_representatives: dict[str, int] = {}
 
-        def root(index: int) -> int:
-            while parents[index] != index:
-                parents[index] = parents[parents[index]]
-                index = parents[index]
-            return index
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
 
-        for left, image in enumerate(candidates):
-            if image.session_id:
-                previous = session_representatives.setdefault(image.session_id, left)
-                parents[root(left)] = root(previous)
-            for right in range(left):
-                if hash_distance(image.dhash, candidates[right].dhash) <= SIMILARITY_MAX_DISTANCE:
-                    parents[root(left)] = root(right)
-        groups: dict[int, list[CollectedImage]] = {}
-        for index, image in enumerate(candidates):
-            groups.setdefault(root(index), []).append(image)
-        return list(groups.values())
-
-    legacy = [image for image in images if not image.captured]
-    candidates = legacy if len(legacy) >= 3 else images
-    group_list = visually_distinct_groups(candidates)
-    if len(group_list) < 3 and candidates is not images:
-        candidates = images
-        group_list = visually_distinct_groups(candidates)
-    if len(group_list) < 3:
-        raise ValueError("At least three visually distinct reviewed image groups are needed for train, validation, and test")
-
-    rng = random.Random(42)
-    rng.shuffle(group_list)
-    group_list.sort(key=len)
-    test_target = max(1, round(len(candidates) * (100 - config.train_percent - config.valid_percent) / 100))
-    valid_target = max(1, round(len(candidates) * config.valid_percent / 100))
-    counts = {split: 0 for split in SPLITS}
-    assignments = {}
-    for index, group in enumerate(group_list):
-        remaining_groups = len(group_list) - index
-        if counts["test"] < test_target and remaining_groups > 2:
-            split = "test"
-        elif counts["valid"] < valid_target and remaining_groups > 1:
-            split = "valid"
-        else:
-            split = "train"
-        for image in group:
-            assignments[image.content_hash] = {"split": split, "dhash": f"{image.dhash:016x}",
-                                               "session_id": image.session_id}
-        counts[split] += len(group)
-    if not all(counts.values()):
-        raise ValueError("Could not make three nonempty, visually separate splits")
-    return assignments
+    for left, image in enumerate(images):
+        if image.session_id:
+            previous = session_representatives.setdefault(image.session_id, left)
+            parents[root(left)] = root(previous)
+        for right in range(left):
+            if hash_distance(image.dhash, images[right].dhash) <= SIMILARITY_MAX_DISTANCE:
+                parents[root(left)] = root(right)
+    groups: dict[int, list[CollectedImage]] = {}
+    for index, image in enumerate(images):
+        groups.setdefault(root(index), []).append(image)
+    return sorted(groups.values(), key=lambda group: (-len(group), min(item.content_hash for item in group)))
 
 
 def _assign_splits(dataset_dir: Path, images: list[CollectedImage], config: GenerateConfig):
-    manifest = _load_split_manifest(dataset_dir)
-    if manifest is None:
-        assignments = _initial_split_assignments(images, config)
-        manifest = {"schema_version": 1, "train_percent": config.train_percent,
-                    "valid_percent": config.valid_percent, "assignments": assignments}
-    else:
-        if (int(manifest["train_percent"]), int(manifest["valid_percent"])) != (
-            config.train_percent, config.valid_percent
-        ):
-            raise ValueError("Split percentages are frozen. Use the saved percentages shown in the generator dialog")
-        assignments = manifest["assignments"].copy()
-        manifest = {**manifest, "assignments": assignments}
+    previous_manifest = _load_split_manifest(dataset_dir)
+    previous = previous_manifest["assignments"] if previous_manifest else {}
+    groups = _visually_distinct_groups(images)
+    if len(groups) < 3:
+        raise ValueError("At least three visually distinct reviewed image groups are needed for train, validation, and test")
 
-    references = [(int(entry["dhash"], 16), entry["split"]) for entry in assignments.values()]
-    split_images = {split: [] for split in SPLITS}
-    conflicts = 0
-    for image in images:
-        entry = assignments.get(image.content_hash)
-        if entry is None:
-            nearby = {split for dhash, split in references
-                      if hash_distance(image.dhash, dhash) <= SIMILARITY_MAX_DISTANCE}
-            if len(nearby) > 1:
-                conflicts += 1
+    total = len(images)
+    valid_target = min(max(1, round(total * config.valid_percent / 100)), total - 2)
+    test_target = min(max(1, round(total * (100 - config.train_percent - config.valid_percent) / 100)),
+                      total - valid_target - 1)
+    targets = {"train": total - valid_target - test_target,
+               "valid": valid_target, "test": test_target}
+    counts = {split: 0 for split in SPLITS}
+    previous_counts = [
+        {split: sum(previous.get(image.content_hash, {}).get("split") == split for image in group)
+         for split in SPLITS}
+        for group in groups
+    ]
+    group_splits = []
+
+    def balance_error(current: dict[str, int]) -> float:
+        return sum((current[split] - targets[split]) ** 2 / targets[split] for split in SPLITS)
+
+    def change_cost(index: int, split: str) -> float:
+        known = previous_counts[index]
+        # Keep previous assignments when the resulting split counts are similarly close to target.
+        return 0.1 * (sum(known.values()) - known[split])
+
+    for index, group in enumerate(groups):
+        empty = [split for split in SPLITS if counts[split] == 0]
+        choices = empty if len(groups) - index == len(empty) else SPLITS
+
+        def score(split: str) -> float:
+            candidate = counts.copy()
+            candidate[split] += len(group)
+            return balance_error(candidate) + change_cost(index, split)
+        chosen = min(choices, key=score)
+        group_splits.append(chosen)
+        counts[chosen] += len(group)
+
+    # Refine whole-group assignments when the first pass misses a target.
+    for _ in range(3):
+        improved = False
+        for index, group in enumerate(groups):
+            current = group_splits[index]
+            if counts[current] == len(group):
                 continue
-            split = nearby.pop() if nearby else "train"
-            entry = {"split": split, "dhash": f"{image.dhash:016x}", "session_id": image.session_id}
-            assignments[image.content_hash] = entry
-            references.append((image.dhash, split))
-        split_images[entry["split"]].append(image)
-    if any(not split_images[split] for split in SPLITS):
-        raise ValueError("The fixed split has no images in train, validation, or test")
-    return split_images, manifest, conflicts
+            baseline = balance_error(counts) + change_cost(index, current)
+            best = current
+            best_score = baseline
+            for split in SPLITS:
+                if split == current:
+                    continue
+                candidate = counts.copy()
+                candidate[current] -= len(group)
+                candidate[split] += len(group)
+                candidate_score = balance_error(candidate) + change_cost(index, split)
+                if candidate_score < best_score - 1e-9:
+                    best, best_score = split, candidate_score
+            if best != current:
+                counts[current] -= len(group)
+                counts[best] += len(group)
+                group_splits[index] = best
+                improved = True
+        if not improved:
+            break
+
+    split_images = {split: [] for split in SPLITS}
+    assignments = {}
+    reassigned = 0
+    for group, split in zip(groups, group_splits):
+        split_images[split].extend(group)
+        for image in group:
+            if previous.get(image.content_hash, {}).get("split") not in (None, split):
+                reassigned += 1
+            assignments[image.content_hash] = {"split": split, "dhash": f"{image.dhash:016x}",
+                                               "session_id": image.session_id}
+    manifest = {"schema_version": 1, "train_percent": config.train_percent,
+                "valid_percent": config.valid_percent, "assignments": assignments}
+    return split_images, manifest, reassigned
 
 
 def _sources(dataset_dir: Path):
@@ -368,8 +380,9 @@ def generate_dataset(
             source_name, image_path, boxes, image_hash, image_difference_hash(image_path),
             session_id or None, include_in_version,
         ))
-    if len(collected) < 3:
-        raise ValueError("At least three paired labeled images are needed for train, validation, and test")
+    eligible = [image for image in collected if image.include_in_version]
+    if len(eligible) < 3:
+        raise ValueError("At least three included labeled images are needed for train, validation, and test")
 
     versions_dir = dataset_dir / "versions"
     versions_dir.mkdir(parents=True, exist_ok=True)
@@ -377,11 +390,7 @@ def generate_dataset(
     while (versions_dir / f"v{version_number}").exists():
         version_number += 1
     version_path = versions_dir / f"v{version_number}"
-    split_images, split_manifest, split_conflicts = _assign_splits(dataset_dir, collected, config)
-    for split in SPLITS:
-        split_images[split] = [image for image in split_images[split] if image.include_in_version]
-    if any(not split_images[split] for split in SPLITS):
-        raise ValueError("Selected classes leave train, validation, or test without any labeled images")
+    split_images, split_manifest, reassigned = _assign_splits(dataset_dir, eligible, config)
     rng = random.Random(42)
     for items in split_images.values():
         rng.shuffle(items)
@@ -439,7 +448,7 @@ def generate_dataset(
         metadata = {"source_images": total_split_images, "split_images": split_counts,
                     "augmented_train_images": generated_count, "excluded_only_images": excluded_only,
                     "duplicate_images": duplicates, "invalid_labels_requeued": len(invalid_labels),
-                    "split_conflicts_skipped": split_conflicts,
+                    "split_reassigned_images": reassigned,
                     "seed": 42, "settings": asdict(config)}
         (build_dir / "generation.yaml").write_text(
             yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")

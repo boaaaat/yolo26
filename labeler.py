@@ -744,7 +744,8 @@ class DatasetGeneratorDialog(QDialog):
 
         hint = QLabel(
             "Each enabled augmentation has a 50% chance per training copy. Validation and test use "
-            "originals. Images with only excluded classes are skipped."
+            "originals. Images with only excluded classes are skipped. Split targets are recalculated "
+            "for each version; similar images stay together, so exact percentages can vary."
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -763,13 +764,10 @@ class DatasetGeneratorDialog(QDialog):
         actions.addWidget(self.generate_button)
         layout.addLayout(actions)
         self._restore_settings()
-        fixed_split = get_split_percentages(self.dataset_dir)
-        if fixed_split is not None:
-            self.train_percent.setValue(fixed_split[0])
-            self.valid_percent.setValue(fixed_split[1])
-            self.train_percent.setEnabled(False)
-            self.valid_percent.setEnabled(False)
-            hint.setText(hint.text() + " Validation and test assignments are fixed across versions.")
+        saved_split = get_split_percentages(self.dataset_dir)
+        if saved_split is not None and not isinstance(self.project.generator_settings, dict):
+            self.train_percent.setValue(saved_split[0])
+            self.valid_percent.setValue(saved_split[1])
 
     def _restore_settings(self) -> None:
         settings = self.project.generator_settings
@@ -845,8 +843,8 @@ class DatasetGeneratorDialog(QDialog):
         self.progress_label.setText(
             f"Created {path}\n{counts['train']} train, {counts['valid']} validation, "
             f"{counts['test']} test originals; {metadata['augmented_train_images']} augmented training images."
-            + (f" {metadata['split_conflicts_skipped']} images skipped to keep splits separate."
-               if metadata.get("split_conflicts_skipped") else "")
+            + (f" {metadata['split_reassigned_images']} existing images changed splits to match the selected percentages."
+               if metadata.get("split_reassigned_images") else "")
             + (" Split assignments were saved in this version, but could not be copied to the dataset root."
                if metadata.get("split_manifest_warning") else "")
         )
