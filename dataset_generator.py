@@ -34,6 +34,16 @@ class GenerateConfig:
     brightness_percent: int = 15
     contrast_percent: int = 15
     blur_radius: float = 0.0
+    resize_mode: str = "none"
+    resize_width: int = 1024
+    resize_height: int = 1024
+    grayscale: bool = False
+    auto_contrast: bool = False
+    sharpen: bool = False
+
+    @property
+    def preprocessing_enabled(self) -> bool:
+        return self.resize_mode != "none" or self.grayscale or self.auto_contrast or self.sharpen
 
 
 @dataclass(frozen=True)
@@ -282,6 +292,36 @@ def _rotate_boxes(boxes, angle: float, image_width: int, image_height: int):
     return rotated
 
 
+def _preprocess(image: Image.Image, boxes, config: GenerateConfig):
+    """Apply export preprocessing and transform labels using the actual resized dimensions."""
+    image = image.convert("RGB")
+    boxes = list(boxes)
+    if config.resize_mode == "stretch":
+        image = image.resize((config.resize_width, config.resize_height), Image.Resampling.LANCZOS)
+        # Normalized coordinates are unchanged when both axes stretch with the image.
+    elif config.resize_mode == "letterbox":
+        source_width, source_height = image.size
+        target_width, target_height = config.resize_width, config.resize_height
+        scale = min(target_width / source_width, target_height / source_height)
+        width = max(1, min(target_width, round(source_width * scale)))
+        height = max(1, min(target_height, round(source_height * scale)))
+        left, top = (target_width - width) // 2, (target_height - height) // 2
+        resized = image.resize((width, height), Image.Resampling.LANCZOS)
+        image = Image.new("RGB", (target_width, target_height), (114, 114, 114))
+        image.paste(resized, (left, top))
+        boxes = [(class_id, (cx * width + left) / target_width,
+                  (cy * height + top) / target_height,
+                  bw * width / target_width, bh * height / target_height)
+                 for class_id, cx, cy, bw, bh in boxes]
+    if config.grayscale:
+        image = ImageOps.grayscale(image).convert("RGB")
+    if config.auto_contrast:
+        image = ImageOps.autocontrast(image)
+    if config.sharpen:
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.0, percent=100, threshold=3))
+    return image, boxes
+
+
 def _augment(image: Image.Image, boxes, config: GenerateConfig, rng: random.Random):
     enabled = []
     if config.horizontal_flip:
@@ -340,6 +380,13 @@ def generate_dataset(
     for value in (config.rotation_degrees, config.brightness_percent, config.contrast_percent, config.blur_radius):
         if value < 0:
             raise ValueError("Augmentation strengths cannot be negative")
+    if config.resize_mode not in {"none", "letterbox", "stretch"}:
+        raise ValueError("Unknown resize mode")
+    if config.resize_mode != "none" and any(
+        type(value) is not int or not 32 <= value <= 8192
+        for value in (config.resize_width, config.resize_height)
+    ):
+        raise ValueError("Resize width and height must be integers between 32 and 8192 pixels")
 
     remap = {old_id: new_id for new_id, old_id in enumerate(config.included_class_ids)}
     collected = []
@@ -410,26 +457,34 @@ def generate_dataset(
                 source_name, image_path, boxes = item.source_name, item.image_path, item.boxes
                 identifier = hashlib.sha256(str(image_path).encode("utf-8")).hexdigest()[:8]
                 stem = f"{source_name}__{image_path.stem}__{identifier}"
-                image_target = build_dir / split / "images" / f"{stem}{image_path.suffix.lower()}"
+                suffix = ".png" if config.preprocessing_enabled else image_path.suffix.lower()
+                image_target = build_dir / split / "images" / f"{stem}{suffix}"
                 label_target = build_dir / split / "labels" / f"{stem}.txt"
-                shutil.copy2(image_path, image_target)
+                original = None
+                if config.preprocessing_enabled or (split == "train" and config.augment_copies):
+                    with Image.open(image_path) as source_image:
+                        original = source_image.convert("RGB")
+                    if config.preprocessing_enabled:
+                        original, boxes = _preprocess(original, boxes, config)
+                if config.preprocessing_enabled:
+                    original.save(image_target, format="PNG")
+                else:
+                    shutil.copy2(image_path, image_target)
                 _write_boxes(label_target, boxes)
                 if split == "train" and config.augment_copies:
-                    with Image.open(image_path) as original:
-                        original = original.convert("RGB")
-                        for copy_index in range(1, config.augment_copies + 1):
-                            for _ in range(5):
-                                augmented, augmented_boxes = _augment(original.copy(), boxes, config, rng)
-                                if not boxes or augmented_boxes:
-                                    break
-                            if boxes and not augmented_boxes:
-                                continue
-                            augmented_stem = f"{stem}__aug{copy_index}"
-                            augmented.save(build_dir / split / "images" / f"{augmented_stem}.jpg",
-                                           format="JPEG", quality=95)
-                            _write_boxes(build_dir / split / "labels" / f"{augmented_stem}.txt",
-                                         augmented_boxes)
-                            generated_count += 1
+                    for copy_index in range(1, config.augment_copies + 1):
+                        for _ in range(5):
+                            augmented, augmented_boxes = _augment(original.copy(), boxes, config, rng)
+                            if not boxes or augmented_boxes:
+                                break
+                        if boxes and not augmented_boxes:
+                            continue
+                        augmented_stem = f"{stem}__aug{copy_index}"
+                        augmented.save(build_dir / split / "images" / f"{augmented_stem}.jpg",
+                                       format="JPEG", quality=95)
+                        _write_boxes(build_dir / split / "labels" / f"{augmented_stem}.txt",
+                                     augmented_boxes)
+                        generated_count += 1
                 processed += 1
                 if progress and (processed % 20 == 0 or processed == total_split_images):
                     progress(f"Processed {processed}/{total_split_images} images...")

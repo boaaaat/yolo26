@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QSlider,
@@ -671,8 +672,16 @@ class DatasetGeneratorDialog(QDialog):
         self.label_issues: list[str] = []
         self.setWindowTitle("Generate YOLO dataset")
         self.setMinimumWidth(520)
+        self.resize(620, 820)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_widget = QWidget()
+        settings_scroll.setWidget(self.settings_widget)
+        outer_layout.addWidget(settings_scroll, 1)
+        layout = QVBoxLayout(self.settings_widget)
         intro = QLabel("Build a new dataset version from labeled/images and labeled/labels. Source images stay in place.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -705,6 +714,35 @@ class DatasetGeneratorDialog(QDialog):
         self.valid_percent.valueChanged.connect(self._update_test_percent)
         self._update_test_percent()
 
+        form.addRow(QLabel("PREPROCESSING · ALL SPLITS"))
+        self.resize_mode = QComboBox()
+        self.resize_mode.addItem("Keep original size", "none")
+        self.resize_mode.addItem("Fit with padding (preserve aspect ratio)", "letterbox")
+        self.resize_mode.addItem("Stretch to width × height", "stretch")
+        form.addRow("Resize", self.resize_mode)
+        resize_dimensions = QHBoxLayout()
+        self.resize_width = QSpinBox()
+        self.resize_height = QSpinBox()
+        for dimension in (self.resize_width, self.resize_height):
+            dimension.setRange(32, 8192)
+            dimension.setValue(1024)
+            dimension.setSuffix(" px")
+        resize_dimensions.addWidget(self.resize_width)
+        resize_dimensions.addWidget(QLabel("×"))
+        resize_dimensions.addWidget(self.resize_height)
+        form.addRow("Width × height", resize_dimensions)
+        self.resize_mode.currentIndexChanged.connect(self._update_resize_controls)
+        self._update_resize_controls()
+        self.preprocess_grayscale = QCheckBox("Grayscale")
+        self.preprocess_grayscale.setToolTip("Remove color; exported images keep three channels.")
+        form.addRow(self.preprocess_grayscale)
+        self.preprocess_auto_contrast = QCheckBox("Automatic contrast")
+        self.preprocess_auto_contrast.setToolTip("Expand each image's intensity range.")
+        form.addRow(self.preprocess_auto_contrast)
+        self.preprocess_sharpen = QCheckBox("Sharpen")
+        self.preprocess_sharpen.setToolTip("Apply mild sharpening to every exported image.")
+        form.addRow(self.preprocess_sharpen)
+        form.addRow(QLabel("AUGMENTATION · TRAINING COPIES"))
         self.augment_copies = QSpinBox()
         self.augment_copies.setRange(0, 10)
         self.augment_copies.setValue(1)
@@ -743,16 +781,19 @@ class DatasetGeneratorDialog(QDialog):
         layout.addLayout(form)
 
         hint = QLabel(
-            "Each enabled augmentation has a 50% chance per training copy. Validation and test use "
-            "originals. Images with only excluded classes are skipped. Split targets are recalculated "
+            "Preprocessing applies to every split and updates box coordinates for padded resizing. "
+            "Processed originals are saved as lossless PNGs. Each enabled augmentation has a 50% "
+            "chance per training copy; validation and test receive preprocessing only. "
+            "Images with only excluded classes are skipped. Split targets are recalculated "
             "for each version; similar images stay together, so exact percentages can vary."
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        layout.addStretch()
         self.progress_label = QLabel("Ready")
         self.progress_label.setWordWrap(True)
-        layout.addWidget(self.progress_label)
+        outer_layout.addWidget(self.progress_label)
         actions = QHBoxLayout()
         actions.addStretch()
         self.close_button = QPushButton("Close")
@@ -762,7 +803,7 @@ class DatasetGeneratorDialog(QDialog):
         self.generate_button.setObjectName("primaryButton")
         self.generate_button.clicked.connect(self.start_generation)
         actions.addWidget(self.generate_button)
-        layout.addLayout(actions)
+        outer_layout.addLayout(actions)
         self._restore_settings()
         saved_split = get_split_percentages(self.dataset_dir)
         if saved_split is not None and not isinstance(self.project.generator_settings, dict):
@@ -778,6 +819,13 @@ class DatasetGeneratorDialog(QDialog):
             checkbox.setChecked(index in included)
         self.train_percent.setValue(int(settings.get("train_percent", 80)))
         self.valid_percent.setValue(int(settings.get("valid_percent", 15)))
+        resize_index = self.resize_mode.findData(settings.get("resize_mode", "none"))
+        self.resize_mode.setCurrentIndex(max(0, resize_index))
+        self.resize_width.setValue(int(settings.get("resize_width", 1024)))
+        self.resize_height.setValue(int(settings.get("resize_height", 1024)))
+        self.preprocess_grayscale.setChecked(bool(settings.get("grayscale", False)))
+        self.preprocess_auto_contrast.setChecked(bool(settings.get("auto_contrast", False)))
+        self.preprocess_sharpen.setChecked(bool(settings.get("sharpen", False)))
         self.augment_copies.setValue(int(settings.get("augment_copies", 1)))
         self.flip.setChecked(bool(settings.get("horizontal_flip", True)))
         self.rotation.setChecked(bool(settings.get("rotation_degrees", 0)))
@@ -792,6 +840,11 @@ class DatasetGeneratorDialog(QDialog):
     def _update_test_percent(self, *_args) -> None:
         remaining = 100 - self.train_percent.value() - self.valid_percent.value()
         self.test_percent.setText(f"{remaining}%" if remaining > 0 else "Set train + validation below 100%")
+
+    def _update_resize_controls(self, *_args) -> None:
+        enabled = self.resize_mode.currentData() != "none"
+        self.resize_width.setEnabled(enabled)
+        self.resize_height.setEnabled(enabled)
 
     def start_generation(self) -> None:
         self.label_issues.clear()
@@ -812,6 +865,12 @@ class DatasetGeneratorDialog(QDialog):
             brightness_percent=self.brightness_percent.value() if self.brightness.isChecked() else 0,
             contrast_percent=self.contrast_percent.value() if self.contrast.isChecked() else 0,
             blur_radius=self.blur_radius.value() if self.blur.isChecked() else 0.0,
+            resize_mode=self.resize_mode.currentData(),
+            resize_width=self.resize_width.value(),
+            resize_height=self.resize_height.value(),
+            grayscale=self.preprocess_grayscale.isChecked(),
+            auto_contrast=self.preprocess_auto_contrast.isChecked(),
+            sharpen=self.preprocess_sharpen.isChecked(),
         )
         self.project.generator_settings = asdict(config)
         try:
@@ -833,6 +892,7 @@ class DatasetGeneratorDialog(QDialog):
         self.generation_worker.failed.connect(self.generation_thread.quit)
         self.generation_thread.finished.connect(self.generation_worker.deleteLater)
         self.generation_thread.finished.connect(self.on_thread_finished)
+        self.settings_widget.setEnabled(False)
         self.generate_button.setEnabled(False)
         self.close_button.setEnabled(False)
         self.progress_label.setText("Preparing dataset...")
@@ -875,6 +935,7 @@ class DatasetGeneratorDialog(QDialog):
         self.generation_thread.deleteLater()
         self.generation_thread = None
         self.generation_worker = None
+        self.settings_widget.setEnabled(True)
         self.generate_button.setEnabled(True)
         self.close_button.setEnabled(True)
 
