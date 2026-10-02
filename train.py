@@ -14,7 +14,7 @@ DATASET_PATH = None
 MODEL = r"C:\Users\Abhil\Desktop\yolo26\runs\yolo26m\weights\best.pt"
 
 # EPOCHS = 250  # Total for "new"; additional epochs for "continue".
-EPOCHS = 50
+EPOCHS = 100
 
 IMAGE_SIZE = 1024
 BATCH_SIZE = 4
