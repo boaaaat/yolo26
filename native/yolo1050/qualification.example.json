@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "baseline": {
+    "map50_95": null,
+    "enemy_recall": null,
+    "distant_enemy_recall": null,
+    "roblox_fps": null,
+    "roblox_p95_frame_ms": null
+  },
+  "candidates": [
+    {
+      "name": "nano-int8",
+      "config": "settings.example.json",
+      "engine": "../../artifacts/yolo1050/engine-cache/REPLACE_WITH_MEASURED_ENGINE.engine",
+      "engine_sha256": "REPLACE_WITH_ENGINE_SHA256",
+      "same_gameplay_conditions": false,
+      "thermal_stable": false,
+      "fresh_predictions_per_second": null,
+      "capture_to_publication_p95_ms": null,
+      "roblox_fps": null,
+      "roblox_p95_frame_ms": null,
+      "map50_95": null,
+      "enemy_recall": null,
+      "distant_enemy_recall": null,
+      "runtime_memory_increment_mib": null
+    }
+  ]
+}

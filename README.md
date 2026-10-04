@@ -46,6 +46,12 @@ Every five seconds while armed, the bot reports fresh desktop-capture inference 
 
 CPU capture/resize remains the initial capture backend. Native Direct3D/CUDA capture, TensorRT-RTX, INT8, and FP8 are later options if measurements justify them; they are not enabled here. No tests, smoke tests, engine builds, or FPS benchmarks were run as part of implementing this entry point.
 
+## Native GTX 1050 / 4 GB deployment
+
+The additive [native GTX 1050 runtime](native/yolo1050/README.md) provides C++ D3D11 capture, TensorRT 8.6.1 FP32/INT8 engine building, fixed rectangular 1024-long-edge input, fused CUDA preprocessing, a pinned CPU capture fallback for Intel-driven laptop displays, bounded frame scheduling, the existing control behavior, and an optional native overlay. Model preparation and narrower/distilled/QAT candidates use `prepare_yolo1050.py` and `train_yolo1050.py`; `select_yolo1050.py` selects from user-supplied qualification measurements without running evaluations. The friend's live runtime does not use Python/PyTorch.
+
+Follow that runtime's separate CUDA 11.8/TensorRT 8.6.1 setup; the Blackwell CUDA 13 requirements are incompatible with Pascal. The 60 FPS target, accuracy limits, Roblox impact, and runtime memory target remain unverified. No tests, smoke runs, exports, training, engine builds, native compilation, or benchmarks were run for this implementation.
+
 ## Setup
 
 Install Python 3.10 or newer and the packages needed for labeling and training:

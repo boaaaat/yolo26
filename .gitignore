@@ -35,3 +35,8 @@ venv/
 *.tmp
 *.log
 *.zip
+
+# Dedicated Pascal preparation artifacts and native build output
+/artifacts/yolo1050/
+/native/yolo1050/build/
+/native/yolo1050/*.local.json
