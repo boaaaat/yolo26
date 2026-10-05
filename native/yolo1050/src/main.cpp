@@ -169,7 +169,9 @@ int wmain(int argc, wchar_t** argv) {
             std::wstring arg = argv[i];
             if (arg == L"--config" && i + 1 < argc) config = argv[++i];
             else if (arg == L"--precision" && i + 1 < argc) {
-                std::wstring p = argv[++i]; precision.assign(p.begin(), p.end());
+                std::wstring p = argv[++i];
+                y1050::require(p == L"fp32" || p == L"int8", "--precision must be fp32 or int8");
+                precision = p == L"fp32" ? "fp32" : "int8";
             } else if (arg == L"--build-only") build_only = true;
             else if (arg == L"--help" || arg == L"-h") {
                 std::cout << "yolo1050.exe --config settings.json [--precision fp32|int8] [--build-only]\n"

@@ -4,7 +4,25 @@ This is an additive C++17 deployment for a Pascal SM 6.1 GPU. Python is used onl
 
 The default target is **60 fresh desktop-capture predictions/s**, full-screen coverage, and a **1024-pixel long edge**. A 16:9 display uses a 1024×576 input. Neither 60 FPS alongside Roblox, the accuracy limits, nor the 512 MiB additional VRAM target has been measured. Roblox's 5% performance allowance is a qualification criterion; this program cannot reserve a fixed GPU percentage or guarantee game performance as workload changes.
 
-No tests, smoke runs, model exports, training, engine builds, live inference, or benchmarks were run while implementing these files. The native binary has not been compiled: the development machine currently exposes CUDA 13, rather than the required CUDA 11.8/TensorRT 8.6.1 SDK.
+The 1920×1080 candidate has been exported to a static 1024×576 ONNX model, and 512 training-only calibration images have been prepared. The Release executable has been compiled for SM 6.1 using a separate CUDA 11.8/TensorRT 8.6.1 toolchain. No tests, smoke runs, accuracy evaluations, training, target-machine engine builds, live inference, or performance benchmarks have been run. The development GPU is an RTX 5080, so deployment engines must still be built on the friend's GTX 1050.
+
+## Prepared 1080p handoff
+
+The locally generated `artifacts/yolo1050/friend-1080p-ready.zip` contains the executable, matching runtime DLLs, model, calibration images, configuration, dependency licenses, hashes, and launchers. Extract the entire ZIP on the friend's laptop; no Python, C++ compiler, or CUDA toolkit installation is needed there. A working NVIDIA driver compatible with the GTX 1050 and CUDA 11.8 is required.
+
+1. Close Roblox and double-click **1-build-engines.cmd**. It builds separate FP32 and calibrated INT8 engines on the GTX 1050. TensorRT executes calibration and times tactics during construction; this is not performance qualification.
+2. Open Rivals, enter practice, lock the cursor, and double-click **2-calibrate-display.cmd**. Keep the cursor still and press **=**. This package expects the primary display to be 1920×1080.
+3. Double-click **3-start-int8.cmd**, then press **=** to arm, **-** to pause, or **Ctrl+C** to exit. `start-fp32.cmd` launches the retained FP32 candidate instead.
+
+`settings.json` defaults to full-screen 1024×576 processing at a 60 Hz target, with collection and overlay off. Automatic capture uses the pinned CPU fallback if Intel drives the laptop display. Engine caches and display calibration are created locally on the laptop. Neither an engine from the RTX 5080 nor its display calibration is included.
+
+To recreate the ZIP after preparing artifacts and compiling the executable:
+
+```powershell
+python native/yolo1050/package_friend.py
+```
+
+The packager refuses to overwrite an existing output; use `--output artifacts/yolo1050/friend-1080p-v2` for another package. The frozen source checkpoint remains in the preparation folder and is not needed in the handoff ZIP.
 
 ## 1. Prepare a candidate on the training machine
 
@@ -30,6 +48,7 @@ Install these **side by side with the existing Blackwell environment**, without 
 - TensorRT **8.6.1 Windows x64 CUDA 11.8 ZIP SDK**, including its `include` and `lib` folders.
 - CUDA Toolkit **11.8**, with Visual Studio integration.
 - The matching **cuDNN 8.9.0 CUDA 11.x** runtime dependencies.
+- **zlibwapi.dll**, including the historic export ordinals used by cuDNN 8.9. The prepared package builds zlib 1.3.2 with `zlibwapi.def`; renaming a standard `zlib1.dll` is insufficient.
 - Visual Studio 2019 C++ build tools, Windows SDK, and CMake 3.24+.
 - OpenCV 4 for Windows, using a compatible MSVC build.
 
@@ -43,6 +62,14 @@ cmake --build native/yolo1050/build --config Release
 The build targets `sm_61` explicitly and rejects non-8.6.1 TensorRT headers and non-11.8 CUDA compilers. It obtains nlohmann/json 3.11.3 during configuration unless that version is already installed. It does not configure or create a test suite.
 
 The output is `native/yolo1050/build/Release/yolo1050.exe`. The SDK runtime DLL directories must be on the executable's DLL search path: TensorRT `lib`, CUDA 11.8 `bin`, cuDNN `bin`, and the OpenCV runtime directory (commonly `build/x64/vc16/bin`). Keep the Microsoft Visual C++ runtime installed. The friend's live deployment does not need Python, PyTorch, Triton, ModelOpt, or the training dataset. Engine construction additionally uses TensorRT's ONNX parser and the prepared calibration bundle.
+
+The existing private local toolchain lives in the ignored `artifacts/yolo1050/toolchain` folder. Its download provenance records original sources and hashes. `build_native.ps1` selects the private MSVC 2019 14.29 compiler, the installed Windows SDK, CUDA 11.8, TensorRT 8.6.1.6, and OpenCV 4.10.0 without replacing the existing CUDA 13 environment:
+
+```powershell
+native/yolo1050/build_native.ps1
+```
+
+This produces `native/yolo1050/build/release-11.8/yolo1050.exe` and compiles only the required zlib library from `toolchain/zlib-src/zlib-1.3.2`, using `zlibwapi.def` to preserve cuDNN's imported ordinals. It never builds or runs zlib example/test programs. `package_friend.py` copies the app-local Microsoft C++ runtime DLLs and matching SDK runtime libraries beside the executable. Static PE import inspection was used for packaging; the executable and GPU libraries were not launched.
 
 ## 3. Build engines on the GTX 1050
 
@@ -62,7 +89,7 @@ INT8 uses TensorRT 8.6's entropy calibration rather than the modern Ultralytics 
 
 ## 4. Configure and run
 
-Run the existing `calibrate.py` on the friend's machine once its display resolution is set. The calibration file must match the actual primary display.
+The handoff ZIP uses `calibrate_display.ps1` through its second launcher, so the friend does not need Python. For a repository deployment, run the existing `calibrate.py` once the display resolution is set. The calibration file must match the actual primary display.
 
 ```powershell
 python calibrate.py
@@ -131,4 +158,6 @@ Qualification records refer to one measured engine, gameplay workload, and runti
 - [TensorRT 8.6.1 support matrix](https://archive.docs.nvidia.com/tensorrt/tensorrt-861/support-matrix/index.html)
 - [TensorRT 8.6 ONNX operator support](https://github.com/onnx/onnx-tensorrt/blob/8.6-GA/docs/operators.md)
 - [CUDA 11.8 D3D11 interoperability](https://docs.nvidia.com/cuda/archive/11.8.0/cuda-runtime-api/group__CUDART__D3D11.html)
+- [cuDNN 8.9 Windows dependencies](https://docs.nvidia.com/deeplearning/cudnn/archives/cudnn-890/install-guide/index.html#install-zlib-windows)
+- [zlib's historic Windows export ordinals](https://github.com/madler/zlib/blob/v1.3.1/contrib/vstudio/vc9/zlibvc.def)
 - [Ultralytics NMS-free export](https://docs.ultralytics.com/modes/export)

@@ -36,6 +36,10 @@ def unwrap_student(yolo):
         wrapper = yolo.model
         wrapper._remove_feature_hooks()
         yolo.model = wrapper.student_model
+        # load_checkpoint normalizes the wrapper's args; the serialized student can retain a training namespace.
+        yolo.model.args = dict(wrapper.args) if isinstance(wrapper.args, dict) else vars(wrapper.args).copy()
+        yolo.model.pt_path = wrapper.pt_path
+        yolo.model.task = wrapper.task
     return yolo
 
 

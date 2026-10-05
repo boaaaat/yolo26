@@ -1,6 +1,6 @@
 # Model preparation/training only. The C++ runtime does not import Python or PyTorch.
 # Keep this environment separate from the friend's native TensorRT/CUDA 11.8 deployment.
-ultralytics==8.4.162
+ultralytics==8.4.166
 onnx==1.19.1
 onnxslim==0.1.96
 numpy
