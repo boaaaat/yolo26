@@ -22,6 +22,21 @@ public:
     }
     ~ShutdownGuard() { state_.pause(); state_.shutdown = true; SetConsoleCtrlHandler(console_control, FALSE); active_state = nullptr; }
 };
+std::string foreground_process() {
+    DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return "unknown";
+    wchar_t path[32768]{}; DWORD length = DWORD(std::size(path));
+    bool queried = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
+    CloseHandle(process); if (!queried) return "unknown";
+    std::wstring name(path, length); auto slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name.erase(0, slash + 1);
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, name.data(), int(name.size()), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return "unknown";
+    std::string result(size_t(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, name.data(), int(name.size()), result.data(), bytes, nullptr, nullptr);
+    return result;
+}
 class Telemetry {
     HMODULE library_ = nullptr;
     void* device_ = nullptr;
@@ -51,24 +66,44 @@ public:
         unsigned temperature = 0, clock = 0;
         if (device_ && temperature_ && temperature_(device_, 0, &temperature) == 0) std::cout << "; " << temperature << " C";
         if (device_ && clocks_ && clocks_(device_, 1, &clock) == 0) std::cout << "; SM " << clock << " MHz";
-        std::cout << ".\n";
+        std::cout << "; foreground " << foreground_process() << ".\n";
     }
 };
 struct Statistics {
     uint64_t completed = 0, published = 0, stale = 0;
+    uint64_t enemy_frames = 0, target_frames = 0, malformed = 0, invalid_boxes = 0;
+    std::array<uint64_t, 3> detections{};
+    std::array<float, 3> max_score{};
     std::vector<double> ages;
     double capture = 0, resize = 0, completion = 0, preprocess_gpu = 0, model_gpu = 0, download_gpu = 0;
     Statistics() { ages.reserve(4096); }
     void reset() {
         completed = published = stale = 0; ages.clear();
+        enemy_frames = target_frames = malformed = invalid_boxes = 0; detections = {}; max_score = {};
         capture = resize = completion = preprocess_gpu = model_gpu = download_gpu = 0;
     }
-    void report(double elapsed, CaptureCounts before, CaptureCounts after, bool timing) {
+    void observe(const DetectionSummary& summary, int enemy) {
+        for (size_t i = 0; i < detections.size(); ++i) {
+            detections[i] += summary.above_threshold[i];
+            max_score[i] = std::max(max_score[i], summary.max_score[i]);
+        }
+        enemy_frames += summary.above_threshold[enemy] > 0; target_frames += summary.target_selected;
+        malformed += summary.malformed; invalid_boxes += summary.invalid_boxes;
+    }
+    void report(double elapsed, CaptureCounts before, CaptureCounts after, const Options& options) {
         std::cout << std::fixed << std::setprecision(1)
             << "Fresh desktop inference " << completed / elapsed << " FPS; published " << published / elapsed
             << " FPS; capture " << (after.captured - before.captured) / elapsed
             << " FPS; superseded/dropped " << after.dropped - before.dropped
-            << "; unchanged/pointer-only " << after.unchanged - before.unchanged << "; stale/disarmed " << stale << ".\n";
+            << "; capture timeouts " << after.timeouts - before.timeouts
+            << "; pointer-only " << after.pointer_only - before.pointer_only
+            << "; repeated presents " << after.repeated - before.repeated << "; stale/disarmed " << stale << ".\n";
+        std::cout << std::setprecision(3) << "Detections in interval (confidence >= " << options.confidence
+            << "): dead " << detections[0] << ", enemy " << detections[1] << ", teammate " << detections[2]
+            << "; frames with enemy " << enemy_frames << '/' << completed
+            << "; target selected " << target_frames << '/' << published
+            << "; max scores dead/enemy/teammate " << max_score[0] << '/' << max_score[1] << '/' << max_score[2]
+            << "; malformed rows " << malformed << ", invalid boxes " << invalid_boxes << ".\n";
         if (!ages.empty()) {
             double mean = std::accumulate(ages.begin(), ages.end(), 0.0) / ages.size();
             std::sort(ages.begin(), ages.end());
@@ -76,7 +111,7 @@ struct Statistics {
             std::cout << std::setprecision(2) << "Mean ms: acquire " << capture / completed
                 << ", capture copy/CPU resize " << resize / completed << ", transfer+GPU+result " << completion / completed
                 << "; capture-start to publication " << mean << " (p95 " << p95 << ")";
-            if (timing) std::cout << "; GPU upload/preprocess " << preprocess_gpu / completed
+            if (options.stage_timing) std::cout << "; GPU upload/preprocess " << preprocess_gpu / completed
                                  << ", model " << model_gpu / completed << ", result download " << download_gpu / completed;
             std::cout << ".\n";
         }
@@ -96,6 +131,9 @@ void run(const Options& options, const EngineArtifact& artifact) {
         require(enemy == -1, "Multiple enemy classes"); enemy = i;
     }
     require(enemy >= 0, "Enemy class not found");
+    std::cout << "Runtime update v6; engine precision " << artifact.metadata.at("identity").at("precision").get<std::string>()
+              << "; confidence " << options.confidence << "; controls " << (options.controls_enabled ? "on" : "off")
+              << "; enemy class ID " << enemy << ".\n";
     std::cout << "Full display " << geometry.screen_w << 'x' << geometry.screen_h << " -> " << geometry.width
               << 'x' << geometry.height << "; 1024 long edge, no crop.\n";
     bool qualified = options.qualification.is_object() &&
@@ -103,6 +141,7 @@ void run(const Options& options, const EngineArtifact& artifact) {
     std::cout << (qualified ? "Qualification recorded from user-supplied measurements.\n" :
                               "Performance/accuracy qualification is pending; 60 FPS and game impact are unverified.\n");
     State state; load_calibration(state, options, geometry);
+    std::cout << "Calibrated locked cursor: " << state.locked_x << ',' << state.locked_y << ".\n";
     // Destruction order keeps GPU resources alive until in-flight reads have completed.
     Capture capture(options, state, geometry);
     Runner runner(artifact, geometry, options);
@@ -140,7 +179,10 @@ void run(const Options& options, const EngineArtifact& artifact) {
                 float preprocessing = 0, model = 0, transfer = 0;
                 auto output = runner.finish(preprocessing, model, transfer); auto completed = Clock::now();
                 ++statistics.completed;
-                bool accepted = publish(state, options, geometry, output, runner.candidates, enemy, slot->captured, slot->generation);
+                DetectionSummary summary;
+                bool accepted = publish(state, options, geometry, output, runner.candidates, enemy,
+                                        slot->captured, slot->generation, summary);
+                statistics.observe(summary, enemy);
                 if (accepted) ++statistics.published; else ++statistics.stale;
                 auto publication = Clock::now();
                 statistics.capture += slot->capture_ms; statistics.resize += slot->resize_ms;
@@ -154,7 +196,7 @@ void run(const Options& options, const EngineArtifact& artifact) {
         }
         auto now = Clock::now();
         if (seconds(now - reporting) >= options.report_seconds) {
-            auto current = capture.counts(); statistics.report(seconds(now - reporting), previous, current, options.stage_timing);
+            auto current = capture.counts(); statistics.report(seconds(now - reporting), previous, current, options);
             telemetry.report(); previous = current; reporting = now; statistics.reset();
         }
     }
@@ -164,7 +206,7 @@ void run(const Options& options, const EngineArtifact& artifact) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        y1050::fs::path config; bool build_only = false; std::string precision;
+        y1050::fs::path config; bool build_only = false, view_detections = false; std::string precision;
         for (int i = 1; i < argc; ++i) {
             std::wstring arg = argv[i];
             if (arg == L"--config" && i + 1 < argc) config = argv[++i];
@@ -173,8 +215,9 @@ int wmain(int argc, wchar_t** argv) {
                 y1050::require(p == L"fp32" || p == L"int8", "--precision must be fp32 or int8");
                 precision = p == L"fp32" ? "fp32" : "int8";
             } else if (arg == L"--build-only") build_only = true;
+            else if (arg == L"--view-detections") view_detections = true;
             else if (arg == L"--help" || arg == L"-h") {
-                std::cout << "yolo1050.exe --config settings.json [--precision fp32|int8] [--build-only]\n"
+                std::cout << "yolo1050.exe --config settings.json [--precision fp32|int8] [--build-only] [--view-detections]\n"
                              "Build engines on the GTX 1050 with Roblox closed. Live startup never builds engines.\n"; return 0;
             } else throw std::runtime_error("Unknown/incomplete argument");
         }
@@ -183,6 +226,11 @@ int wmain(int argc, wchar_t** argv) {
         if (!precision.empty()) {
             y1050::require(precision == "fp32" || precision == "int8", "--precision must be fp32 or int8");
             options.precision = precision;
+        }
+        y1050::require(!build_only || !view_detections, "--view-detections is a live display option, not an engine build option");
+        if (view_detections) {
+            options.overlay = true; options.stage_timing = true;
+            options.controls_enabled = false; options.auto_shoot = false;
         }
         // Normal priority; no busy-spin CUDA waiting or multiple inference contexts.
         y1050::require(SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS), "Normal process priority");

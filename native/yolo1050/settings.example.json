@@ -26,6 +26,7 @@
   "report_seconds": 5.0,
   "fp32_layer_patterns": [],
   "controls": {
+    "enabled": true,
     "auto_shoot": true,
     "instant_mouse": false,
     "mouse_update_hz": 240,

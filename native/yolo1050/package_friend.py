@@ -9,6 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = Path(__file__).resolve().parent
+VIEW_LAUNCHERS = ("4-view-detections-fp32.cmd", "4-view-detections-int8.cmd")
 
 
 def digest(path):
@@ -23,17 +24,52 @@ def copy(source: Path, target: Path):
     shutil.copy2(source, target)
 
 
+def write_archive(output: Path, archive_path: Path, include_folder: bool = True):
+    with zipfile.ZipFile(archive_path, "x", zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as archive:
+        for path in sorted(output.rglob("*")):
+            if path.is_file():
+                relative = path.relative_to(output)
+                archive.write(path, Path(output.name) / relative if include_folder else relative)
+    print(f"Ready: {archive_path} ({archive_path.stat().st_size / 1048576:.1f} MiB)", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=ROOT / "artifacts/yolo1050/nano-fp32")
     parser.add_argument("--toolchain", type=Path, default=ROOT / "artifacts/yolo1050/toolchain")
     parser.add_argument("--binary", type=Path, default=NATIVE / "build/release-11.8/yolo1050.exe")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/yolo1050/friend-1080p-ready")
+    parser.add_argument("--runtime-update-only", action="store_true",
+                        help="Package only the rebuilt executable and capture instructions; use a new --output")
     args = parser.parse_args()
     model, sdk, output = args.model.resolve(), args.toolchain.resolve(), args.output.resolve()
     archive_path = output.with_suffix(".zip")
     if output.exists() or archive_path.exists():
         raise ValueError("Preserve an existing package; choose a new --output")
+    if args.runtime_update_only:
+        copy(args.binary.resolve(), output / "runtime/yolo1050.exe")
+        copy(NATIVE / "CAPTURE-FIX.txt", output / "CAPTURE-FIX.txt")
+        copy(NATIVE / "apply_runtime_update.ps1", output / "apply_runtime_update.ps1")
+        copy(NATIVE / "APPLY-CAPTURE-UPDATE.cmd", output / "APPLY-CAPTURE-UPDATE.cmd")
+        for name in VIEW_LAUNCHERS:
+            copy(NATIVE / name, output / name)
+        base_package = json.loads((ROOT / "artifacts/yolo1050/friend-1080p-ready/package-manifest.json").read_text(encoding="utf-8"))
+        runtime_files = {Path(name).name: info for name, info in base_package["files"].items()
+                         if name.startswith("runtime/") and name.endswith(".dll")}
+        dependencies = sorted(runtime_files)
+        record = {"schema": 2, "kind": "runtime-update", "qualified": False,
+                  "change": "Detection counts/confidence, separate capture-miss counters, SSE2 CPU resize, optional detection views",
+                  "engine_cache": "Reuse existing engines; engine identity, model, and preprocessing unchanged",
+                  "required_runtime_dlls": dependencies,
+                  "required_runtime_files": runtime_files,
+                  "install_root_files": list(VIEW_LAUNCHERS),
+                  "files": {p.relative_to(output).as_posix(): {"sha256": digest(p), "bytes": p.stat().st_size}
+                            for p in sorted(output.rglob("*")) if p.is_file()}}
+        (output / "runtime-update.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        print("Packaging runtime update only; no executable launched.", flush=True)
+        # Updates merge directly into an existing installation's runtime folder.
+        write_archive(output, archive_path, include_folder=False)
+        return
     manifest = json.loads((model / "export.json").read_text(encoding="utf-8"))
     calibration = json.loads((model / "calibration.json").read_text(encoding="utf-8"))
     if manifest["input_shape"] != [1, 3, 576, 1024] or calibration["count"] != 512 or calibration["split"] != "train":
@@ -77,6 +113,9 @@ def main():
                   cache_dir="engine-cache", mouse_calibration="mouse_calibration.json", engine=None)
     (output / "settings.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     copy(NATIVE / "calibrate_display.ps1", output / "calibrate_display.ps1")
+    copy(NATIVE / "CAPTURE-FIX.txt", output / "CAPTURE-FIX.txt")
+    for name in VIEW_LAUNCHERS:
+        copy(NATIVE / name, output / name)
     copy(ROOT / "calibrate.py", output / "calibrate.py")
     copy(ROOT / "dataset_utils.py", output / "dataset_utils.py")
     prefix = '@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\nset "PATH=%~dp0runtime;%PATH%"\r\n'
@@ -123,6 +162,7 @@ exit /b 1
         "Overlay and collection are off. The model sees the full screen at 1024x576, with no crop.\n"
         "Do not reuse another GPU's engine cache or another display's mouse calibration.\n"
         "Re-run calibration after changing the primary display resolution.\n\n"
+        "If step 3 reports Desktop Duplication / 0x887A0004, read CAPTURE-FIX.txt.\n\n"
         "The model was exported and the Release executable was compiled. No tests, accuracy evaluations,\n"
         "FPS benchmarks, Roblox-performance measurements, target-machine engine builds, or live inference\n"
         "were run during package preparation. 60 FPS, accuracy, and Roblox impact remain unverified.\n",
@@ -147,11 +187,7 @@ exit /b 1
                         for p in sorted(output.rglob("*")) if p.is_file()}}
     (output / "package-manifest.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     print("Packaging", len(record["files"]), "files; no executable or calibration UI launched.", flush=True)
-    with zipfile.ZipFile(archive_path, "x", zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as archive:
-        for path in sorted(output.rglob("*")):
-            if path.is_file():
-                archive.write(path, Path(output.name) / path.relative_to(output))
-    print(f"Ready: {archive_path} ({archive_path.stat().st_size / 1048576:.1f} MiB)", flush=True)
+    write_archive(output, archive_path)
 
 
 if __name__ == "__main__":

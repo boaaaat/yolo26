@@ -2,8 +2,14 @@
 #include "common.hpp"
 namespace y1050 {
 void load_calibration(State&, const Options&, const Geometry&);
+struct DetectionSummary {
+    std::array<uint64_t, 3> above_threshold{};
+    std::array<float, 3> max_score{};
+    uint64_t malformed = 0, invalid_boxes = 0;
+    bool target_selected = false;
+};
 bool publish(State&, const Options&, const Geometry&, const float*, int candidates, int enemy,
-             Clock::time_point captured, uint64_t generation);
+             Clock::time_point captured, uint64_t generation, DetectionSummary&);
 class Controls {
     State& state_;
     const Options& options_;

@@ -1,0 +1,82 @@
+Step 3: Desktop Duplication failed, HRESULT -2005270524 / 0x887A0004
+
+This is DXGI_ERROR_UNSUPPORTED in screen capture. The runtime has found a
+cached engine, but has not started TensorRT inference yet.
+
+Apply the small runtime update:
+1. Close the detector window.
+2. Extract the ENTIRE small update ZIP to a folder. Run
+   APPLY-CAPTURE-UPDATE.cmd and select the ORIGINAL full package folder
+   containing 3-start-int8.cmd and settings.json. The installer prints
+   the selected folder and the required runtime DLL location. If DLLs
+   are missing, a second file picker asks for the ORIGINAL 2.1 GB
+   friend-1080p-ready.zip. Select that ZIP, not the small update ZIP.
+   The installer restores only missing runtime DLLs, checks their original
+   hashes, and then copies the updated executable into runtime.
+3. Run 3-start-int8.cmd from the ORIGINAL package folder. The runtime tries all matching
+   primary-display outputs and logs their Intel/NVIDIA adapter names.
+
+Update v6: detection and speed reporting
+The normal launcher now reports detections above the existing confidence
+threshold, maximum scores for dead/enemy/teammate, frames containing an enemy,
+and frames with a selected target. "Published FPS" is completed result frames,
+including empty predictions; it is not a detection count. Capture timeouts,
+pointer-only updates, and repeated presents are reported separately.
+The Intel readback path uses SSE2 to process BGRA channels together with the
+same integer bilinear coefficients, rounding, RGB conversion, and 1024x576
+input. A speed increase has not been measured.
+
+Optional detection views in the original installation:
+  4-view-detections-fp32.cmd
+  4-view-detections-int8.cmd
+These use the respective existing engines, show all three classes as boxes,
+and report GPU stage times. Mouse movement and shooting are disabled in these
+views; = arms detection and - pauses it. They do not edit settings.json or
+rebuild engines. Keep Roblox visible in front of the console. Close the view
+before starting the regular launcher. Overlay and GPU timing add work, so
+view-mode FPS does not qualify the regular overlay-off configuration.
+This update does not establish that INT8 preserves the original accuracy.
+
+If Windows says nvinfer.dll was not found:
+The small update is not a standalone installation. Run step 3 from the
+original full package, where runtime\yolo1050.exe and runtime\nvinfer.dll
+are in the same folder. If that runtime folder was replaced or its DLLs
+are missing, run the latest update installer and select the original
+2.1 GB ZIP when prompted. It restores DLLs without extracting/replacing
+the model, settings, engine-cache, or mouse_calibration.json.
+You do not need to build engines again for this executable update.
+
+If the installer finds commands/settings but reports missing DLLs:
+The selected package root is valid, but those files alone do not make
+the runtime complete. The required layout is:
+  selected-folder\3-start-int8.cmd
+  selected-folder\settings.json
+  selected-folder\runtime\yolo1050.exe
+  selected-folder\runtime\nvinfer.dll (and the other runtime DLLs)
+DLLs in another nested folder or still inside a ZIP are not available
+to this executable. Use the installer's original-ZIP recovery picker.
+Large DLLs take time to extract and hash; keep the installer open.
+
+If 0x887A0004 still appears on the Intel/NVIDIA laptop:
+1. Close the detector. Open Windows Settings > System > Display > Graphics
+   (on Windows 10 this may be named Graphics settings).
+2. Browse for the Desktop app runtime\yolo1050.exe inside your extracted
+   friend-1080p-ready folder. Select Options > Power saving (Intel) > Save.
+3. Restart 3-start-int8.cmd. CUDA inference explicitly uses the GTX 1050;
+   the Power saving preference allows Direct3D capture through Intel.
+4. Use Roblox in windowed/borderless mode in the laptop's local Windows
+   session. If capture still fails, check that the Intel display adapter
+   is enabled and uses the laptop manufacturer's Intel graphics driver.
+
+Keep the existing engine-cache, model folder, settings.json, and
+mouse_calibration.json. No engine rebuild or recalibration is needed for
+this executable update when the primary display geometry is unchanged.
+No NVIDIA, Intel, or Windows driver change is included in this update.
+
+The new executable has been compiled for SM 6.1. No tests, smoke runs,
+live inference, accuracy evaluations, or benchmarks were run here.
+The cause on this laptop and the capture fix still need confirmation
+from its next launch. 60 FPS remains unverified.
+
+Microsoft documents the hybrid-GPU Desktop Duplication failure:
+https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/error-when-dda-capable-app-is-against-gpu

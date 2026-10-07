@@ -56,18 +56,22 @@ void load_calibration(State& state, const Options& o, const Geometry& g) {
             state.locked_y < g.screen_h, "Invalid locked cursor position");
 }
 bool publish(State& state, const Options& o, const Geometry& g, const float* output, int count, int enemy,
-             Clock::time_point captured, uint64_t generation) {
+             Clock::time_point captured, uint64_t generation, DetectionSummary& summary) {
+    summary = {};
     std::vector<Detection> targets, display; targets.reserve(o.max_targets); display.reserve(o.max_display);
     for (int i = 0; i < count; ++i) {
         auto row = output + i * 6; bool finite = true;
         for (int j = 0; j < 6; ++j) finite = finite && std::isfinite(row[j]);
-        if (!finite || row[4] < o.confidence || row[4] > 1 || row[5] < 0 || row[5] > 2 ||
-            row[5] != std::nearbyint(row[5])) continue;
+        if (!finite || row[4] < 0 || row[4] > 1 || row[5] < 0 || row[5] > 2 ||
+            row[5] != std::nearbyint(row[5])) { ++summary.malformed; continue; }
         Detection d{std::clamp((row[0] - g.left) / g.scale, 0.0f, float(g.screen_w)),
                     std::clamp((row[1] - g.top) / g.scale, 0.0f, float(g.screen_h)),
                     std::clamp((row[2] - g.left) / g.scale, 0.0f, float(g.screen_w)),
                     std::clamp((row[3] - g.top) / g.scale, 0.0f, float(g.screen_h)), row[4], int(row[5])};
-        if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;
+        if (d.x2 <= d.x1 || d.y2 <= d.y1) { ++summary.invalid_boxes; continue; }
+        summary.max_score[d.cls] = std::max(summary.max_score[d.cls], d.score);
+        if (d.score < o.confidence) continue;
+        ++summary.above_threshold[d.cls];
         if (d.cls == enemy && targets.size() < size_t(o.max_targets)) targets.push_back(d);
         if (o.overlay && display.size() < size_t(o.max_display)) display.push_back(d);
     }
@@ -85,6 +89,7 @@ bool publish(State& state, const Options& o, const Geometry& g, const float* out
         });
     }
     state.visible = chosen; if (chosen) state.target = chosen;
+    summary.target_selected = bool(chosen);
     state.display = std::move(display); state.captured = captured; ++state.result_generation; return true;
 }
 void Controls::run() noexcept {
@@ -111,7 +116,7 @@ void Controls::run() noexcept {
                 std::lock_guard<std::mutex> lock(state_.mutex);
                 if (state_.captured != Clock::time_point{} && seconds(now - state_.captured) > options_.max_age)
                     state_.clear_locked();
-                if (!state_.running || !state_.visible) {
+                if (!options_.controls_enabled || !state_.running || !state_.visible) {
                     if (mouse_down) { button(false); mouse_down = false; }
                     remaining_x = remaining_y = 0; last_generation = state_.result_generation;
                 } else {

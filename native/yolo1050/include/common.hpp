@@ -123,7 +123,7 @@ struct Options {
     double confidence = 0.5, max_age = .1, report_seconds = 5, hotkey_seconds = .003;
     double shot_interval = .10, shot_hold = .09, aim_height = .9, aim_time = .03, max_step = 70;
     double match_iou = .10, match_distance = .65, match_area = 4;
-    bool auto_shoot = true, instant = false, overlay = false, graph = true, stage_timing = false;
+    bool controls_enabled = true, auto_shoot = true, instant = false, overlay = false, graph = true, stage_timing = false;
     std::string precision = "int8", capture_backend = "auto", enemy_name = "enemy";
     std::vector<std::string> fp32_layers;
     Json qualification;
@@ -146,6 +146,7 @@ struct Options {
         o.fp32_layers = j.value("fp32_layer_patterns", std::vector<std::string>{});
         o.qualification = j.value("qualification", Json());
         auto c = j.value("controls", Json::object());
+        o.controls_enabled = c.value("enabled", true);
         o.auto_shoot = c.value("auto_shoot", true); o.instant = c.value("instant_mouse", false);
         o.mouse_hz = c.value("mouse_update_hz", 240); o.aim_height = c.value("aim_height_from_bottom", .9);
         o.aim_time = c.value("aim_time_constant_seconds", .03); o.max_step = c.value("max_mouse_step_pixels", 70.0);

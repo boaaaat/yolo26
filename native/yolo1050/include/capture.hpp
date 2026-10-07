@@ -16,7 +16,9 @@ struct CaptureSlot {
     Clock::time_point captured{};
     double capture_ms = 0, resize_ms = 0;
 };
-struct CaptureCounts { uint64_t captured = 0, dropped = 0, unchanged = 0, interruptions = 0; };
+struct CaptureCounts {
+    uint64_t captured = 0, dropped = 0, timeouts = 0, pointer_only = 0, repeated = 0, interruptions = 0;
+};
 class Capture {
     const Options& options_;
     State& state_;
